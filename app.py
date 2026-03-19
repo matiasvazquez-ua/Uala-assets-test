@@ -240,7 +240,40 @@ IDENTIFIER_STOPWORDS = {
     "argentina", "colombia", "mexico", "méxico", "bancar", "dashboard", "grafico", "gráfico", "panel",
     "quiero", "mostrar", "mostrame", "muéstrame", "necesito", "desde", "hasta", "para", "sobre",
     "resumen", "ejecutivo", "comparar", "top", "usuarios", "garantia", "garantía", "costo", "costos",
+    "entre", "datos", "calidad", "critico", "crítico", "paises", "países", "gasto", "inversion", "inversión",
 }
+GENERIC_CATEGORY_PROMPT_ALIASES = {"activo", "activos"}
+DASHBOARD_EXPLICIT_HINTS = {"dashboard", "insight", "grafico", "grafica", "gráfico", "gráfica", "panel"}
+DASHBOARD_VISUAL_HINTS = {"mostrar", "mostrame", "muéstrame", "ver", "quiero", "armar", "arma", "generar", "grafico", "grafica", "panel"}
+DASHBOARD_AGGREGATION_HINTS = {"comparar", "distribucion", "distribución", "ranking", "mix", "apertura", "brecha", "score"}
+MASS_UPLOAD_COLUMN_ALIASES = {
+    "name": ["Nombre", "Name", "Nombre del activo", "Asset Name"],
+    "hostname": ["Hostname", "Host name", "Nombre de host", "Computer Name"],
+    "model": ["Modelo", "Model", "Nombre del modelo"],
+    "purchase_date": ["Fecha compra", "Fecha de compra", "Purchase Date"],
+    "status": ["Estado", "Estado del activo", "Status"],
+    "entity": ["Entidad", "Entidad del activo", "Entity"],
+    "warranty_date": ["Fecha garantia", "Fecha garantía", "Garantia", "Garantía", "Warranty", "Warranty End"],
+    "cost": ["Costo", "Cost", "Precio", "Purchase Price"],
+    "serial": ["Serial", "Serial Number", "Número de serie", "Numero de serie"],
+    "country": ["Pais", "País", "Country"],
+    "assignment": ["Asignacion", "Asignación", "Assigned To", "Usuario asignado", "Asignado a"],
+    "provider": ["Proveedor", "Provider"],
+    "category": ["Categoria", "Categoría", "Category", "Tipo", "Tipo de activo", "Object Type"],
+    "company": ["Compania", "Compañía", "Company"],
+}
+MASS_UPDATE_IDENTIFIER_ALIASES = [
+    "Serial",
+    "Serial Number",
+    "Hostname",
+    "Host name",
+    "Jira",
+    "Jira Key",
+    "Object Key",
+    "Identificador",
+    "Identifier",
+    "Asset Key",
+]
 CHAT_PAYLOAD_PREFIX = "__CHAT_PAYLOAD__::"
 
 THEMES = {
@@ -361,6 +394,68 @@ def normalize_lookup_key(value: Any) -> str:
     text = "".join(ch for ch in unicodedata.normalize("NFD", text) if unicodedata.category(ch) != "Mn")
     text = re.sub(r"[^a-z0-9 ]+", " ", text)
     return " ".join(text.split())
+
+
+def lookup_tokens(value: Any) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", normalize_lookup_key(value)))
+
+
+def matches_lookup_keyword(lookup_text: str, keyword: str, *, lookup_token_set: set[str] | None = None) -> bool:
+    normalized_keyword = normalize_lookup_key(keyword)
+    if not normalized_keyword:
+        return False
+    tokens = lookup_token_set if lookup_token_set is not None else set(re.findall(r"[a-z0-9]+", lookup_text))
+    if len(normalized_keyword.split()) == 1 and len(normalized_keyword) <= 3:
+        return normalized_keyword in tokens
+    return bool(re.search(rf"(?<![a-z0-9]){re.escape(normalized_keyword)}(?![a-z0-9])", lookup_text))
+
+
+def normalize_tabular_value(value: Any) -> str:
+    if pd is not None:
+        try:
+            if pd.isna(value):
+                return ""
+        except Exception:
+            pass
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+    text = str(value or "").strip()
+    if text.lower() in {"", "nan", "nat", "none"}:
+        return ""
+    if re.fullmatch(r"-?\d+\.0", text):
+        return text[:-2]
+    return text
+
+
+def build_row_lookup(row: dict[str, Any]) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for key, value in row.items():
+        normalized_key = normalize_lookup_key(key)
+        normalized_value = normalize_tabular_value(value)
+        if normalized_key and normalized_value and normalized_key not in lookup:
+            lookup[normalized_key] = normalized_value
+    return lookup
+
+
+def get_row_value_by_aliases(row_lookup: dict[str, str], aliases: list[str]) -> str:
+    alias_keys = [normalize_lookup_key(alias) for alias in aliases if normalize_lookup_key(alias)]
+    for alias_key in alias_keys:
+        if alias_key in row_lookup:
+            return row_lookup[alias_key]
+    for alias_key in alias_keys:
+        for key, value in row_lookup.items():
+            if alias_key and (alias_key in key or key in alias_key):
+                return value
+    return ""
+
+
+def company_for_country(country: str) -> str:
+    canonical = canonical_country(country)
+    return {
+        "Argentina": "Bancar ARG",
+        "Colombia": "Bancar COL",
+        "México": "Bancar MEX",
+    }.get(canonical, "")
 
 
 def parse_date(value: str) -> datetime | None:
@@ -746,6 +841,39 @@ def decode_chat_payload(content: Any) -> tuple[str, list[dict[str, Any]]]:
     text = str(payload.get("text") or "")
     charts = payload.get("charts") or []
     return text, charts if isinstance(charts, list) else []
+
+
+def remember_dashboard_response(prompt: str, response: str) -> None:
+    text, charts = decode_chat_payload(response)
+    if not charts:
+        return
+    st.session_state["last_dashboard_prompt"] = prompt
+    st.session_state["last_dashboard_text"] = text
+    st.session_state["last_dashboard_charts"] = charts
+    st.session_state["last_dashboard_updated_at"] = datetime.now().isoformat(timespec="seconds")
+
+
+def restore_dashboard_state_from_history() -> None:
+    if st.session_state.get("last_dashboard_charts"):
+        return
+    history = st.session_state.get("chat_history", [])
+    for idx in range(len(history) - 1, -1, -1):
+        message = history[idx]
+        if message.get("role") != "assistant":
+            continue
+        text, charts = decode_chat_payload(message.get("content"))
+        if not charts:
+            continue
+        prompt = ""
+        for prev_idx in range(idx - 1, -1, -1):
+            previous = history[prev_idx]
+            if previous.get("role") == "user":
+                prompt = str(previous.get("content") or "")
+                break
+        st.session_state["last_dashboard_prompt"] = prompt
+        st.session_state["last_dashboard_text"] = text
+        st.session_state["last_dashboard_charts"] = charts
+        return
 
 
 def generate_html_report(assets_filtered: list[dict[str, Any]]) -> str:
@@ -1506,8 +1634,8 @@ def update_asset_status(config: AppConfig, object_id: str, object_type_id: str, 
 def parse_assignment_action(prompt: str) -> tuple[str, str] | None:
     text = (prompt or "").strip()
     patterns = [
-        r"(?:asigna|asignar|asigname)\s+(?:(?:el|la|este|esta)\s+)?(?:laptop|notebook|equipo|activo)?\s*([A-Za-z0-9._\-/]+)\s+(?:a|para)\s+(.+)$",
-        r"(?:asigna|asignar)\s+serial\s+([A-Za-z0-9._\-/]+)\s+(?:a|para)\s+(.+)$",
+        r"(?:asign(?:a|ar|ame|ale|á))\s+(?:(?:el|la|este|esta)\s+)?(?:laptop|notebook|equipo|activo)?\s*([A-Za-z0-9._\-/]+)\s+(?:a|para)\s+(.+)$",
+        r"(?:asign(?:a|ar|á))\s+serial\s+([A-Za-z0-9._\-/]+)\s+(?:a|para)\s+(.+)$",
     ]
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
@@ -1540,7 +1668,7 @@ def parse_unassign_action(prompt: str) -> tuple[str, str] | None:
 def parse_status_change_action(prompt: str) -> tuple[str, str] | None:
     text = (prompt or "").strip()
     patterns = [
-        r"(?:cambia(?:r)?|pasar|pone(?:r)?)\s+(?:el\s+)?estado\s+(?:de\s+)?([A-Za-z0-9._\-/]+)\s+(?:a|en)\s+(.+)$",
+        r"(?:cambi(?:a|ar|á)|pas(?:a|ar|á)|pon(?:e|er|é))\s+(?:el\s+)?estado\s+(?:de\s+)?([A-Za-z0-9._\-/]+)\s+(?:a|en)\s+(.+)$",
         r"([A-Za-z0-9._\-/]+)\s+(?:a|en)\s+(stock nuevo|stock usado|en uso|asignado al edificio)$",
     ]
     for pattern in patterns:
@@ -2498,9 +2626,10 @@ def cached_fetch_assets(config: AppConfig, aql_query: str, ttl_minutes: int, *, 
 
 
 def detect_category_from_prompt(prompt: str) -> str | None:
-    text = normalize_text(prompt)
+    text = normalize_lookup_key(prompt)
+    tokens = lookup_tokens(prompt)
     if any(
-        phrase in text
+        matches_lookup_keyword(text, phrase, lookup_token_set=tokens)
         for phrase in [
             "a quien",
             "a quién",
@@ -2513,8 +2642,10 @@ def detect_category_from_prompt(prompt: str) -> str | None:
         ]
     ):
         return None
-    for alias, canonical in CATEGORY_ALIAS_TO_CANONICAL.items():
-        if alias in text:
+    for alias, canonical in sorted(CATEGORY_ALIAS_TO_CANONICAL.items(), key=lambda item: len(normalize_lookup_key(item[0])), reverse=True):
+        if normalize_lookup_key(alias) in GENERIC_CATEGORY_PROMPT_ALIASES:
+            continue
+        if matches_lookup_keyword(text, alias, lookup_token_set=tokens):
             return canonical
     return None
 
@@ -2544,29 +2675,28 @@ def detect_status_from_prompt(prompt: str) -> str | None:
 
 
 def detect_country_from_prompt(prompt: str) -> str | None:
-    text = normalize_text(prompt)
-    tokens = set(re.findall(r"[a-z0-9]+", text))
+    text = normalize_lookup_key(prompt)
+    tokens = lookup_tokens(prompt)
     has_email = "@" in (prompt or "")
+    explicit_company = detect_company_from_prompt(prompt)
     for country, keywords in PAIS_KEYWORDS.items():
-        for keyword in keywords:
-            norm_kw = normalize_text(keyword)
-            if len(norm_kw) <= 3:
-                if has_email:
+        for keyword in sorted(keywords, key=lambda value: len(normalize_lookup_key(value)), reverse=True):
+            normalized_keyword = normalize_lookup_key(keyword)
+            if len(normalized_keyword) <= 3:
+                if has_email or explicit_company:
                     continue
-                if norm_kw in tokens:
-                    return country
-            else:
-                if norm_kw in text:
-                    return country
+            if matches_lookup_keyword(text, keyword, lookup_token_set=tokens):
+                return country
     return None
 
 
 def detect_company_from_prompt(prompt: str) -> str | None:
     text = normalize_lookup_key(prompt)
+    tokens = lookup_tokens(prompt)
     for canonical, keywords in COMPANIA_KEYWORDS.items():
-        normalized_keywords = [normalize_lookup_key(k) for k in keywords]
-        if any(k and k in text for k in normalized_keywords):
-            return canonical
+        for keyword in sorted(keywords, key=lambda value: len(normalize_lookup_key(value)), reverse=True):
+            if matches_lookup_keyword(text, keyword, lookup_token_set=tokens):
+                return canonical
     return None
 
 
@@ -3137,38 +3267,38 @@ def calculate_depreciation(assets: list[dict[str, Any]], years: int = 3) -> dict
 
 
 def parse_bulk_location_action(prompt: str) -> tuple[list[str], str, str] | None:
-    t = normalize_text(prompt)
-    if not any(k in t for k in ["bulk", "lote", "masivo", "actualiza", "actualizar"]):
-        return None
-    if not any(k in t for k in ["pais", "país", "compania", "compañia", "company"]):
+    t = normalize_lookup_key(prompt)
+    if not re.search(r"\b(?:bulk|lote|masiv\w*|actualiz\w*|cambi\w*|mov\w*|pas\w*)\b", t):
         return None
     ids = re.findall(r"[A-Za-z0-9][A-Za-z0-9._\-/]{5,}", prompt or "")
     ids = [i for i in ids if re.search(r"[A-Za-z]", i) and re.search(r"\d", i)]
     if not ids:
         return None
-    company = ""
-    for c in ["Bancar ARG", "Bancar COL", "Bancar MEX"]:
-        if normalize_text(c) in t:
-            company = c
-            break
     country = detect_country_from_prompt(prompt) or ""
-    if not company:
-        company = "Bancar MEX" if "mex" in t else "Bancar COL" if "col" in t else "Bancar ARG"
-    if not country:
-        country = "México" if "mex" in t else "Colombia" if "col" in t else "Argentina"
+    company = detect_company_from_prompt(prompt) or ""
+    if not country and not company:
+        return None
+    if not country and company:
+        country = {"Bancar ARG": "Argentina", "Bancar COL": "Colombia", "Bancar MEX": "México"}.get(company, "")
+    if not company and country:
+        company = company_for_country(country)
+    if not company or not country:
+        return None
     return ids, company, country
 
 
 def parse_filters_from_prompt(prompt: str) -> dict[str, str]:
     t = normalize_text(prompt)
     f: dict[str, str] = {}
-    category = detect_category_from_prompt(prompt)
+    attribute_search = detect_attribute_search(prompt)
+    category = None if attribute_search else detect_category_from_prompt(prompt)
     status = detect_status_from_prompt(prompt)
     country = detect_country_from_prompt(prompt)
     company = detect_company_from_prompt(prompt)
     entity = detect_entity_from_prompt(prompt)
     person = parse_assignee_query(prompt)
-    serial = extract_serial_candidate(prompt) if any(x in t for x in ["serial", "sn", "equipo", "hostname", "host"]) else None
+    identifier_context = any(x in t for x in ["serial", "sn", "equipo", "hostname", "host", "jira", "key"]) or bool(parse_assignee_of_identifier_query(prompt)) or len(t.split()) <= 3
+    serial = extract_serial_candidate(prompt) if identifier_context else None
     if not serial:
         # Caso común: el usuario escribe solo el identificador (serial/hostname/key).
         token = (prompt or "").strip()
@@ -3183,7 +3313,7 @@ def parse_filters_from_prompt(prompt: str) -> dict[str, str]:
         owner_of = parse_assignee_of_identifier_query(prompt)
         if owner_of:
             serial = owner_of
-    if not serial:
+    if not serial and identifier_context:
         candidates = extract_identifier_candidates(prompt)
         if candidates:
             serial = candidates[0]
@@ -3205,7 +3335,7 @@ def parse_filters_from_prompt(prompt: str) -> dict[str, str]:
     if mail:
         f["assignee"] = mail.group(0)
     model = re.search(r"(?:modelo|model)\s+(.+)$", prompt, flags=re.IGNORECASE)
-    if model:
+    if model and not attribute_search:
         f["model"] = model.group(1).strip().strip("\"'")
     return f
 
@@ -3286,7 +3416,7 @@ def search_assets_by_attribute(assets: list[dict[str, Any]], campo: str, operado
 
 def detect_attribute_search(prompt: str) -> tuple[str, str, str] | None:
     """Detecta consultas libres por atributo en lenguaje natural."""
-    pattern = r"(?:activos|equipos|assets)\s+(?:donde|con|que\s+tienen?)\s+(\w[\w\s]*?)\s+(contiene|empieza\s+con|termina\s+con|es|igual\s+a)\s+['\"]?(.+)['\"]?$"
+    pattern = r"(?:activos|equipos|assets)\s+(?:donde|con|que\s+t(?:ienen?|engan))\s+(\w[\w\s]*?)\s+(contiene|empieza\s+con|termina\s+con|es|igual\s+a)\s+['\"]?(.+)['\"]?$"
     m = re.search(pattern, prompt.strip(), flags=re.IGNORECASE)
     if not m:
         return None
@@ -4075,14 +4205,28 @@ def answer_inventory_question(assets: list[dict[str, Any]], prompt: str) -> str:
 
 
 def parse_nl_dashboard_request(prompt: str) -> dict[str, Any]:
-    t = normalize_text(prompt)
-    if not any(k in t for k in ["dashboard", "insight", "grafico", "gráfico", "panel"]):
+    lookup = normalize_lookup_key(prompt)
+    tokens = lookup_tokens(prompt)
+    show_spend = any(keyword in lookup for keyword in ["gasto", "costo", "inversion", "depreciacion", "valor contable"])
+    show_geo = any(keyword in lookup for keyword in ["pais", "geograf", "ubicacion", "region"])
+    show_quality = any(keyword in lookup for keyword in ["calidad", "quality", "cobertura", "faltantes", "completitud"])
+    show_stock = any(keyword in lookup for keyword in ["stock", "critico", "periferic", "disponibilidad"])
+    signal_count = sum(bool(flag) for flag in [show_spend, show_geo, show_quality, show_stock])
+    explicit_dashboard = any(matches_lookup_keyword(lookup, hint, lookup_token_set=tokens) for hint in DASHBOARD_EXPLICIT_HINTS)
+    visual_intent = any(matches_lookup_keyword(lookup, hint, lookup_token_set=tokens) for hint in DASHBOARD_VISUAL_HINTS)
+    aggregation_intent = any(matches_lookup_keyword(lookup, hint, lookup_token_set=tokens) for hint in DASHBOARD_AGGREGATION_HINTS)
+    if not (explicit_dashboard or (visual_intent and signal_count >= 1) or signal_count >= 2 or (aggregation_intent and signal_count >= 1)):
         return {}
+    if explicit_dashboard and signal_count == 0:
+        show_spend = True
+        show_geo = True
+        show_quality = True
+        show_stock = True
     return {
-        "show_spend": any(k in t for k in ["gasto", "costo", "inversion", "inversión"]),
-        "show_geo": any(k in t for k in ["pais", "país", "geograf"]),
-        "show_quality": any(k in t for k in ["calidad", "quality", "cobertura", "faltantes"]),
-        "show_stock": any(k in t for k in ["stock", "critico", "crítico", "periferic", "periféric"]),
+        "show_spend": show_spend,
+        "show_geo": show_geo,
+        "show_quality": show_quality,
+        "show_stock": show_stock,
         "filters": parse_filters_from_prompt(prompt),
         "raw": prompt,
     }
@@ -4126,37 +4270,40 @@ def build_dashboard_chat_payload(assets: list[dict[str, Any]], prompt: str) -> s
         "Asignado al edificio": "#64748b",
         "Sin estado": "#cbd5e1",
     }
+    show_all = not any(bool(request.get(key)) for key in ["show_spend", "show_geo", "show_quality", "show_stock"])
 
     charts: list[dict[str, Any]] = []
     geo_df = pd.DataFrame(
         [{"País": a.get("country") or "Sin país", "Compañía": a.get("company") or "Sin compañía", "Categoría": a.get("category") or "Sin cat"} for a in working]
     )
-    sun_df = geo_df.groupby(["País", "Compañía", "Categoría"]).size().reset_index(name="Cantidad")
-    fig1 = px.sunburst(
-        sun_df,
-        path=["País", "Compañía", "Categoría"],
-        values="Cantidad",
-        title="Distribución País → Compañía → Categoría",
-        color_discrete_sequence=["#111827", "#334155", "#475569", "#64748b", "#94a3b8", "#cbd5e1"],
-    )
-    fig1.update_traces(textinfo="label+percent parent")
-    fig1.update_layout(**layout)
-    charts.append({"title": "Distribución geográfica", "figure_json": fig1.to_json()})
+    if request.get("show_geo") or show_all:
+        sun_df = geo_df.groupby(["País", "Compañía", "Categoría"]).size().reset_index(name="Cantidad")
+        fig1 = px.sunburst(
+            sun_df,
+            path=["País", "Compañía", "Categoría"],
+            values="Cantidad",
+            title="Distribución País → Compañía → Categoría",
+            color_discrete_sequence=["#111827", "#334155", "#475569", "#64748b", "#94a3b8", "#cbd5e1"],
+        )
+        fig1.update_traces(textinfo="label+percent parent")
+        fig1.update_layout(**layout)
+        charts.append({"title": "Distribución geográfica", "figure_json": fig1.to_json()})
 
     estado_df = pd.DataFrame([{"Categoría": a.get("category") or "Sin cat", "Estado": a.get("status") or "Sin estado"} for a in working])
-    est_count = estado_df.groupby(["Categoría", "Estado"]).size().reset_index(name="Cantidad")
-    fig2 = px.bar(
-        est_count,
-        x="Categoría",
-        y="Cantidad",
-        color="Estado",
-        barmode="stack",
-        title="Estado por Categoría de activo",
-        color_discrete_map=color_map,
-        text_auto=True,
-    )
-    fig2.update_layout(**layout, xaxis=dict(gridcolor="rgba(0,0,0,0.06)"), yaxis=dict(gridcolor="rgba(0,0,0,0.06)"))
-    charts.append({"title": "Estado por categoría", "figure_json": fig2.to_json()})
+    if request.get("show_stock") or show_all:
+        est_count = estado_df.groupby(["Categoría", "Estado"]).size().reset_index(name="Cantidad")
+        fig2 = px.bar(
+            est_count,
+            x="Categoría",
+            y="Cantidad",
+            color="Estado",
+            barmode="stack",
+            title="Estado por Categoría de activo",
+            color_discrete_map=color_map,
+            text_auto=True,
+        )
+        fig2.update_layout(**layout, xaxis=dict(gridcolor="rgba(0,0,0,0.06)"), yaxis=dict(gridcolor="rgba(0,0,0,0.06)"))
+        charts.append({"title": "Estado por categoría", "figure_json": fig2.to_json()})
 
     quality = {
         "Serial": sum(1 for a in working if get_serial_value(a)),
@@ -4166,25 +4313,26 @@ def build_dashboard_chat_payload(assets: list[dict[str, Any]], prompt: str) -> s
         "País": sum(1 for a in working if a.get("country") and a.get("country") != "Sin país"),
         "Garantía": sum(1 for a in working if a.get("warranty_date")),
     }
-    q_df = pd.DataFrame([{"Campo": k, "Score": round(v / max(total, 1) * 100, 1)} for k, v in quality.items()]).sort_values("Score")
-    fig3 = px.bar(
-        q_df,
-        x="Score",
-        y="Campo",
-        orientation="h",
-        title="Data Quality Score (%)",
-        text="Score",
-        color="Score",
-        color_continuous_scale=["#e7e5e4", "#94a3b8", "#0f766e"],
-        range_color=[0, 100],
-    )
-    fig3.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
-    fig3.update_layout(**layout, xaxis=dict(range=[0, 115]), coloraxis_showscale=False)
-    charts.append({"title": "Data Quality", "figure_json": fig3.to_json()})
+    if request.get("show_quality") or show_all:
+        q_df = pd.DataFrame([{"Campo": k, "Score": round(v / max(total, 1) * 100, 1)} for k, v in quality.items()]).sort_values("Score")
+        fig3 = px.bar(
+            q_df,
+            x="Score",
+            y="Campo",
+            orientation="h",
+            title="Data Quality Score (%)",
+            text="Score",
+            color="Score",
+            color_continuous_scale=["#e7e5e4", "#94a3b8", "#0f766e"],
+            range_color=[0, 100],
+        )
+        fig3.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+        fig3.update_layout(**layout, xaxis=dict(range=[0, 115]), coloraxis_showscale=False)
+        charts.append({"title": "Data Quality", "figure_json": fig3.to_json()})
 
     costo_rows = [(a.get("country") or "Sin país", parse_cost(str(a.get("purchase_price", "")))) for a in working]
     costo_rows = [(p, c) for p, c in costo_rows if c > 0]
-    if costo_rows:
+    if costo_rows and (request.get("show_spend") or show_all):
         costo_por_pais: dict[str, float] = {}
         for pais, amount in costo_rows:
             costo_por_pais[pais] = costo_por_pais.get(pais, 0) + amount
@@ -4270,6 +4418,10 @@ def ensure_session_state() -> None:
     st.session_state.setdefault("last_type_scan_checked", 0)
     st.session_state.setdefault("last_type_scan_hits", 0)
     st.session_state.setdefault("auto_reset_empty_once", False)
+    st.session_state.setdefault("last_dashboard_prompt", "")
+    st.session_state.setdefault("last_dashboard_text", "")
+    st.session_state.setdefault("last_dashboard_charts", [])
+    st.session_state.setdefault("last_dashboard_updated_at", "")
     if not st.session_state["movimientos"]:
         movement_path = MOVEMENTS_FILE
         if movement_path.exists():
@@ -4992,8 +5144,47 @@ def _process_chat_prompt(config: AppConfig, all_assets: list[dict[str, Any]], fi
                 response = f"Falló AQL: {exc}\n\n{answer_inventory_question(filtered_assets, prompt)}"
         else:
             response = answer_inventory_question(filtered_assets, prompt)
+    remember_dashboard_response(prompt, response)
     st.session_state.chat_history.append({"role": "assistant", "content": response})
     push_openai_history(prompt, decode_chat_payload(response)[0])
+
+
+def render_chat_dashboard_panel() -> None:
+    restore_dashboard_state_from_history()
+    charts = st.session_state.get("last_dashboard_charts") or []
+    if not charts:
+        return
+    prompt = str(st.session_state.get("last_dashboard_prompt") or "").strip()
+    text = str(st.session_state.get("last_dashboard_text") or "").strip()
+    updated = str(st.session_state.get("last_dashboard_updated_at") or "").strip()
+
+    st.divider()
+    head_col, clear_col = st.columns([6, 1])
+    head_col.markdown("### Dashboard solicitado")
+    if clear_col.button("Limpiar", key="clear_last_dashboard", use_container_width=True):
+        st.session_state["last_dashboard_prompt"] = ""
+        st.session_state["last_dashboard_text"] = ""
+        st.session_state["last_dashboard_charts"] = []
+        st.session_state["last_dashboard_updated_at"] = ""
+        st.rerun()
+    if prompt:
+        st.caption(f"Consulta: {prompt}")
+    if updated:
+        st.caption(f"Última actualización: {updated}")
+    intro, table_df = parse_chat_response_for_table(text)
+    if intro:
+        st.markdown(intro)
+    if table_df is not None:
+        st.dataframe(table_df, use_container_width=True, hide_index=True)
+    for chart in charts:
+        if pio is None:
+            st.caption(chart.get("title", ""))
+            continue
+        try:
+            fig = pio.from_json(chart.get("figure_json", ""))
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception:
+            st.caption(chart.get("title", ""))
 
 
 # ── 9. EXPORTACIONES (Excel) ──────────────────────────────────────────────
@@ -5458,29 +5649,36 @@ def render_movimientos_page(assets: list[dict[str, Any]]) -> None:
 
 def build_asset_attributes_payload(row: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     """Construye payload de atributos para alta/modificación desde fila tabular."""
+    row_lookup = build_row_lookup(row)
     mapping = {
-        "Nombre": ID_NAME,
-        "Hostname": ID_HOSTNAME,
-        "Modelo": ID_MODELO,
-        "Fecha compra": ID_FECHA_COMPRA,
-        "Estado": ID_ESTADO,
-        "Entidad": ID_ENTIDAD,
-        "Fecha garantia": ID_FECHA_GARANTIA,
-        "Costo": ID_COSTO,
-        "Serial": ID_SERIAL,
-        "Pais": ID_PAIS,
-        "Asignacion": ID_ASIGNACION,
-        "Proveedor": ID_PROVEEDOR,
-        "Categoria": ID_CATEGORIA,
-        "Compania": ID_COMPANIA,
+        "name": ID_NAME,
+        "hostname": ID_HOSTNAME,
+        "model": ID_MODELO,
+        "purchase_date": ID_FECHA_COMPRA,
+        "status": ID_ESTADO,
+        "entity": ID_ENTIDAD,
+        "warranty_date": ID_FECHA_GARANTIA,
+        "cost": ID_COSTO,
+        "serial": ID_SERIAL,
+        "country": ID_PAIS,
+        "assignment": ID_ASIGNACION,
+        "provider": ID_PROVEEDOR,
+        "category": ID_CATEGORIA,
+        "company": ID_COMPANIA,
     }
     attrs: list[dict[str, Any]] = []
-    for col, attr_id in mapping.items():
-        value = str(row.get(col, "")).strip()
+    for field_name, attr_id in mapping.items():
+        value = get_row_value_by_aliases(row_lookup, MASS_UPLOAD_COLUMN_ALIASES[field_name])
         if value:
             attrs.append({"objectTypeAttributeId": str(attr_id), "objectAttributeValues": [{"value": value}]})
-    type_id = CATEGORY_TO_TYPE_ID.get(canonical_category(str(row.get("Categoria", ""))), KNOWN_OBJECT_TYPE_IDS[0])
+    category_value = get_row_value_by_aliases(row_lookup, MASS_UPLOAD_COLUMN_ALIASES["category"])
+    type_id = CATEGORY_TO_TYPE_ID.get(canonical_category(category_value), KNOWN_OBJECT_TYPE_IDS[0])
     return type_id, attrs
+
+
+def resolve_mass_update_identifier(row: dict[str, Any]) -> str:
+    row_lookup = build_row_lookup(row)
+    return get_row_value_by_aliases(row_lookup, MASS_UPDATE_IDENTIFIER_ALIASES)
 
 
 def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]]) -> None:
@@ -5560,12 +5758,13 @@ def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]]) -> None
                 results = []
                 total_rows = len(frame_mod)
                 for idx, row in frame_mod.iterrows():
-                    identifier = str(row.get("Serial", "") or row.get("Hostname", "") or row.get("Jira", "")).strip()
+                    row_dict = row.to_dict()
+                    identifier = resolve_mass_update_identifier(row_dict)
                     asset = find_asset_by_identifier(assets, identifier)
                     if not asset:
                         results.append({"fila": idx + 1, "identificador": identifier, "ok": False, "detalle": "No encontrado"})
                         continue
-                    type_id, attrs = build_asset_attributes_payload(row.to_dict())
+                    type_id, attrs = build_asset_attributes_payload(row_dict)
                     if simulate:
                         results.append({"fila": idx + 1, "identificador": identifier, "ok": True, "detalle": f"Simulación ({len(attrs)} attrs)"})
                     elif not attrs:
@@ -5747,16 +5946,11 @@ def render_chat_page(config: AppConfig, assets: list[dict[str, Any]]) -> None:
             intro, table_df = parse_chat_response_for_table(plain)
             if intro:
                 st.markdown(intro)
+            if charts:
+                st.caption("Dashboard visual actualizado en la sección de abajo.")
             if table_df is not None:
                 st.dataframe(table_df, use_container_width=True, hide_index=True)
-            for chart in charts:
-                if pio is None:
-                    continue
-                try:
-                    fig = pio.from_json(chart.get("figure_json", ""))
-                    st.plotly_chart(fig, use_container_width=True)
-                except Exception:
-                    st.caption(chart.get("title", ""))
+    render_chat_dashboard_panel()
 
     prompt = st.chat_input("Preguntá por los activos de Uala...")
     if prompt:
