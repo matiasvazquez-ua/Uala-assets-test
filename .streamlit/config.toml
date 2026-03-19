@@ -1,17 +1,17 @@
 [server]
 headless = true
-enableCORS = false
+enableCORS = true
 enableXsrfProtection = true
 
 [browser]
 gatherUsageStats = false
 
 [theme]
-base = "dark"
-primaryColor = "#E11D48"
-backgroundColor = "#0B0B0E"
-secondaryBackgroundColor = "#12141A"
-textColor = "#F5F5F7"
+base = "light"
+primaryColor = "#1F2937"
+backgroundColor = "#F5F5F4"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#111827"
 font = "sans serif"
 
 [client]

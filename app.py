@@ -1,12 +1,15 @@
 # ── 1. IMPORTS & CONFIGURACIÓN ──────────────────────────────────────────
 import asyncio
+import copy
 import concurrent.futures
 import hashlib
+import html
 import io
 import json
 import os
 import random
 import re
+import threading
 import time
 import unicodedata
 from calendar import monthrange
@@ -76,9 +79,17 @@ def load_env_tolerant(env_path: str = ".env") -> None:
         os.environ.setdefault(key, value)
 
 
-if load_dotenv is not None:
-    load_dotenv(override=False)
+# Este proyecto suele mezclar notas/JSON dentro de `.env`.
+# `python-dotenv` emite warnings ruidosos en ese caso, así que usamos
+# únicamente el loader tolerante que toma solo líneas `KEY=VALUE`.
 load_env_tolerant()
+
+
+def debug_log(message: str) -> None:
+    """Log opcional para diagnosticar el flujo de carga sin romper la app."""
+    if os.getenv("APP_DEBUG", "").strip().lower() not in {"1", "true", "yes"}:
+        return
+    print(f"[APP_DEBUG] {datetime.now().isoformat(timespec='seconds')} {message}", flush=True)
 
 # ── 2. CONSTANTES & MAPEOS ───────────────────────────────────────────────
 SITE = os.getenv("JIRA_SITE", "https://bancar.atlassian.net").rstrip("/")
@@ -87,11 +98,12 @@ SCHEMA_ID = os.getenv("ASSETS_SCHEMA_ID", "40")
 REQUEST_TIMEOUT = (10, 60)
 PAGE_SIZE = int(os.getenv("ASSETS_PAGE_SIZE", "1000"))
 FORCE_FETCH_MIN_ASSETS = int(os.getenv("ASSETS_FORCE_FETCH_MIN", "200"))
-FORCE_FETCH_ENABLED = os.getenv("ASSETS_FORCE_FETCH_ENABLED", "true").strip().lower() in {"1", "true", "yes", "si", "sí"}
+FORCE_FETCH_ENABLED = os.getenv("ASSETS_FORCE_FETCH_ENABLED", "false").strip().lower() in {"1", "true", "yes", "si", "sí"}
 ASSETS_SCOPE_MODE = os.getenv("ASSETS_SCOPE_MODE", "hardware").strip().lower()
-TYPE_SCAN_ENABLED = os.getenv("ASSETS_TYPE_SCAN_ENABLED", "true").strip().lower() in {"1", "true", "yes", "si", "sí"}
+TYPE_SCAN_ENABLED = os.getenv("ASSETS_TYPE_SCAN_ENABLED", "false").strip().lower() in {"1", "true", "yes", "si", "sí"}
 TYPE_SCAN_START = int(os.getenv("ASSETS_TYPE_SCAN_START", "200"))
 TYPE_SCAN_END = int(os.getenv("ASSETS_TYPE_SCAN_END", "500"))
+SEGMENTED_FETCH_ENABLED = os.getenv("ASSETS_SEGMENTED_FETCH_ENABLED", "false").strip().lower() in {"1", "true", "yes", "si", "sí"}
 KNOWN_OBJECT_TYPE_IDS = ["213", "217", "225", "229", "231", "235", "238"]
 GENERAL_HARDWARE_TYPE_ID = os.getenv("JIRA_GENERAL_HARDWARE_TYPE_ID", "211")
 BASE_DIR = Path(__file__).resolve().parent
@@ -100,6 +112,12 @@ AUTO_ASSIGN_RULES_FILE = BASE_DIR / "auto_assign_rules.json"
 AUTO_ASSIGN_LOG_FILE = BASE_DIR / "auto_assign_log.json"
 AUTO_ASSIGN_SNAPSHOT_FILE = BASE_DIR / "auto_assign_snapshot_prev.json"
 MOVEMENTS_FILE = BASE_DIR / "movimientos_uala.jsonl"
+ASSETS_SNAPSHOT_FILE = BASE_DIR / "assets_snapshot.json"
+PROCESS_FETCH_CACHE_TTL_SECONDS = 600
+PROCESS_FETCH_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+PROCESS_FETCH_LOCK = threading.Lock()
+PROCESS_FETCH_JOBS: dict[str, concurrent.futures.Future] = {}
+PROCESS_FETCH_RESULTS: dict[str, tuple[float, list[dict[str, Any]], dict[str, int], list[dict[str, Any]]]] = {}
 
 # IDs de asset_masivo.py
 ID_NAME = "991"
@@ -515,22 +533,70 @@ def config_to_cache_key(config: AppConfig) -> dict[str, str]:
     }
 
 
-def push_structured_error(error: StructuredError) -> None:
-    """Guarda error estructurado en session_state conservando máximo 20 eventos."""
-    if int(error.status_code or 0) < 400:
+def config_from_cache_key(data: dict[str, str]) -> AppConfig:
+    """Reconstruye AppConfig desde una clave serializable."""
+    return AppConfig(
+        jira_email=str(data.get("jira_email") or ""),
+        jira_api_token=str(data.get("jira_api_token") or ""),
+        workspace_id=str(data.get("workspace_id") or ""),
+        site=str(data.get("site") or ""),
+        openai_api_key=str(data.get("openai_api_key") or ""),
+        openai_model=str(data.get("openai_model") or "gpt-4o-mini"),
+        rovo_api_key=str(data.get("rovo_api_key") or ""),
+        rovo_enabled=str(data.get("rovo_enabled") or "").strip().lower() in {"1", "true", "yes", "si", "sí"},
+    )
+
+
+def append_error_events(events: list[dict[str, Any]]) -> None:
+    """Inserta eventos al log de errores de sesión sin asumir contexto fuera del hilo principal."""
+    if not events:
         return
     try:
         log = st.session_state.setdefault("error_log", [])
-        log.insert(0, error.__dict__)
+        for event in events:
+            log.insert(0, event)
         st.session_state["error_log"] = log[:20]
     except Exception:
         return
 
 
+def push_structured_error(error: StructuredError, sink: list[dict[str, Any]] | None = None) -> None:
+    """Guarda error HTTP estructurado; en workers puede acumularlo en un sink local."""
+    if int(error.status_code or 0) < 400:
+        return
+    event = dict(error.__dict__)
+    if sink is not None:
+        sink.append(event)
+        return
+    append_error_events([event])
+
+
+def push_app_error(context: str, detail: str, sink: list[dict[str, Any]] | None = None) -> None:
+    """Registra errores locales no HTTP para soporte y debugging."""
+    event = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "context": context,
+        "detail": detail,
+        "error_type": "APP",
+    }
+    if sink is not None:
+        sink.append(event)
+        return
+    append_error_events([event])
+
+
+def escape_html_text(value: Any) -> str:
+    """Escapa texto dinámico antes de insertarlo en bloques HTML de Streamlit."""
+    return html.escape(str(value or ""), quote=True)
+
+
 def append_movimiento_to_file(movimiento: MovimientoAsset) -> None:
     """Persiste un movimiento al archivo JSONL local."""
-    with MOVEMENTS_FILE.open("a", encoding="utf-8") as handle:
-        handle.write(f"{json.dumps(movimiento.__dict__, ensure_ascii=False)}\n")
+    try:
+        with MOVEMENTS_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(f"{json.dumps(movimiento.__dict__, ensure_ascii=False)}\n")
+    except OSError as exc:
+        push_app_error("append_movimiento_to_file", f"{MOVEMENTS_FILE.name}: {exc}")
 
 
 def log_movimiento(
@@ -595,8 +661,9 @@ def apply_global_filter(assets: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def run_anomaly_detection(assets: list[dict[str, Any]]) -> dict[str, Any]:
     """Detecta anomalías operativas y de calidad en el inventario."""
     by_assignee = Counter(str(a.get("assigned_to") or "").strip() for a in assets if str(a.get("assigned_to") or "").strip())
-    serial_groups = detect_duplicates(assets).get("serial_duplicates", [])
-    host_groups = detect_duplicates(assets).get("hostname_duplicates", [])
+    duplicates = detect_duplicates(assets)
+    serial_groups = duplicates.get("serial_duplicates", [])
+    host_groups = duplicates.get("hostname_duplicates", [])
     today = datetime.now().date()
     garantia_vencida_en_uso = 0
     en_uso_sin_asignado = 0
@@ -622,24 +689,45 @@ def run_anomaly_detection(assets: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def parse_chat_response_for_table(text: str) -> tuple[str, Any]:
-    """Extrae tabla de respuestas con formato `- col1 | col2`."""
+    """Extrae tablas simples desde respuestas markdown con listas separadas por `|`."""
     if pd is None:
         return text, None
-    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
-    pipe_lines = [line[2:].strip() for line in lines if line.startswith("- ") and "|" in line]
-    if len(pipe_lines) < 5:
+    lines = [line for line in str(text or "").splitlines()]
+    asset_lines = [line.strip() for line in lines if line.strip().startswith("- ") and "|" in line and len(line.strip()) > 5]
+    if len(asset_lines) < 3:
         return text, None
-    rows = []
-    max_cols = 0
-    for line in pipe_lines:
-        cols = [c.strip() for c in line.split("|")]
-        max_cols = max(max_cols, len(cols))
+
+    def clean_cell(cell: str) -> str:
+        value = re.sub(r"\*\*(.+?)\*\*", r"\1", str(cell or ""))
+        value = re.sub(r"`(.+?)`", r"\1", value)
+        return value.strip()
+
+    rows: list[list[str]] = []
+    for line in asset_lines:
+        content = line[2:].strip()
+        cols = [clean_cell(c) for c in content.split("|")]
         rows.append(cols)
-    columns = [f"col_{i+1}" for i in range(max_cols)]
+
+    max_cols = max(len(row) for row in rows)
     normalized_rows = [row + [""] * (max_cols - len(row)) for row in rows]
-    df = pd.DataFrame(normalized_rows, columns=columns)
-    intro = "\n".join([line for line in lines if line not in [f"- {p}" for p in pipe_lines]])
-    return intro or "Resultado en tabla:", df
+    header_candidates = {
+        2: ["Activo", "Detalle"],
+        3: ["Activo", "Estado", "Asignado"],
+        4: ["Activo", "Hostname", "Estado", "País"],
+        5: ["Activo", "Hostname", "Serial", "Estado", "Asignado"],
+        6: ["Activo", "Hostname", "Serial", "Estado", "País", "Compañía"],
+        7: ["Activo", "Hostname", "Serial", "Estado", "Asignado", "País", "Modelo"],
+    }
+    columns = header_candidates.get(max_cols, [f"Col {i+1}" for i in range(max_cols)])
+    if len(columns) < max_cols:
+        columns += [f"Col {i+1}" for i in range(len(columns), max_cols)]
+    df = pd.DataFrame(normalized_rows, columns=columns[:max_cols])
+    df = df.replace("", pd.NA).dropna(how="all").fillna("")
+
+    asset_line_set = set(asset_lines)
+    intro_lines = [line for line in lines if line.strip() not in asset_line_set]
+    intro = "\n".join(line for line in intro_lines if line.strip()).strip()
+    return intro or "Resultado:", df
 
 
 def encode_chat_payload(text: str, charts: list[dict[str, Any]] | None = None) -> str:
@@ -670,11 +758,11 @@ def generate_html_report(assets_filtered: list[dict[str, Any]]) -> str:
     rows = []
     for a in assets_filtered[:2000]:
         rows.append(
-            f"<tr><td>{a.get('jira_key','')}</td><td>{a.get('name','')}</td><td>{a.get('status','')}</td>"
-            f"<td>{a.get('assigned_to','')}</td><td>{a.get('country','')}</td><td>{a.get('company','')}</td></tr>"
+            f"<tr><td>{escape_html_text(a.get('jira_key',''))}</td><td>{escape_html_text(a.get('name',''))}</td><td>{escape_html_text(a.get('status',''))}</td>"
+            f"<td>{escape_html_text(a.get('assigned_to',''))}</td><td>{escape_html_text(a.get('country',''))}</td><td>{escape_html_text(a.get('company',''))}</td></tr>"
         )
-    countries_html = "".join(f"<li>{k}: {v}</li>" for k, v in by_country.items())
-    companies_html = "".join(f"<li>{k}: {v}</li>" for k, v in by_company.items())
+    countries_html = "".join(f"<li>{escape_html_text(k)}: {v}</li>" for k, v in by_country.items())
+    companies_html = "".join(f"<li>{escape_html_text(k)}: {v}</li>" for k, v in by_company.items())
     return f"""
     <html><head><meta charset='utf-8'><style>
     body{{font-family:Arial,sans-serif;padding:16px}} .kpis{{display:flex;gap:12px}}
@@ -716,6 +804,7 @@ def jira_request_with_retry(
     json_payload: dict[str, Any] | None = None,
     params: dict[str, Any] | None = None,
     max_attempts: int = 5,
+    error_sink: list[dict[str, Any]] | None = None,
 ) -> httpx.Response:
     """Ejecuta request HTTP con reintentos y backoff para Jira."""
     last_error = None
@@ -748,7 +837,8 @@ def jira_request_with_retry(
                     response_body=body,
                     timestamp=datetime.now().isoformat(timespec="seconds"),
                     context="jira_request_with_retry",
-                )
+                ),
+                sink=error_sink,
             )
             should_retry = response is None or response.status_code >= 500 or response.status_code == 429
             if attempt < max_attempts - 1 and should_retry:
@@ -768,6 +858,7 @@ async def jira_request_with_retry_async(
     json_payload: dict[str, Any] | None = None,
     params: dict[str, Any] | None = None,
     max_attempts: int = 5,
+    error_sink: list[dict[str, Any]] | None = None,
 ) -> httpx.Response:
     """Ejecuta request async con reintentos y backoff para Jira."""
     last_error: Exception | None = None
@@ -799,7 +890,8 @@ async def jira_request_with_retry_async(
                     response_body=body,
                     timestamp=datetime.now().isoformat(timespec="seconds"),
                     context="jira_request_with_retry_async",
-                )
+                ),
+                sink=error_sink,
             )
             should_retry = response is None or response.status_code >= 500 or response.status_code == 429
             if attempt < max_attempts - 1 and should_retry:
@@ -815,6 +907,7 @@ async def _fetch_type_async(
     headers: dict[str, str],
     type_id: str,
     aql_query: str,
+    scope_type_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Consulta de forma asíncrona un objectType puntual y devuelve registros limpios."""
     urls = [
@@ -822,7 +915,10 @@ async def _fetch_type_async(
         f"{config.site}/gateway/api/jsm/assets/workspace/{config.workspace_id}/v1/object/navlist/aql",
         f"{config.site}/rest/servicedeskapi/assets/workspace/{config.workspace_id}/v1/object/aql",
     ]
-    ql = combine_schema_aql(f"({aql_query}) AND objectTypeId = {type_id}" if aql_query.strip() else f"objectTypeId = {type_id}")
+    ql = combine_schema_aql(
+        f"({aql_query}) AND objectTypeId = {type_id}" if aql_query.strip() else f"objectTypeId = {type_id}",
+        type_ids=scope_type_ids,
+    )
     payload_templates = [
         {"resultsPerPage": PAGE_SIZE, "page": 1},
         {"resultPerPage": PAGE_SIZE, "page": 1},
@@ -889,9 +985,13 @@ def fetch_type_sync(
     headers: dict[str, str],
     type_id: str,
     aql_query: str,
+    scope_type_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Consulta síncrona robusta por objectType con paginación defensiva."""
-    ql = combine_schema_aql(f"({aql_query}) AND objectTypeId = {type_id}" if aql_query.strip() else f"objectTypeId = {type_id}")
+    ql = combine_schema_aql(
+        f"({aql_query}) AND objectTypeId = {type_id}" if aql_query.strip() else f"objectTypeId = {type_id}",
+        type_ids=scope_type_ids,
+    )
     return paginate_aql_sync(config, auth, headers, ql)
 
 
@@ -1037,6 +1137,7 @@ def fetch_objects_by_type_bruteforce(
     auth: BasicAuth,
     headers: dict[str, str],
     type_id: str,
+    error_sink: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Fallback agresivo: lista objetos por objectType usando endpoint dedicado."""
     urls = [
@@ -1073,6 +1174,7 @@ def fetch_objects_by_type_bruteforce(
                         auth=auth,
                         headers=headers,
                         json_payload=payload,
+                        error_sink=error_sink,
                     )
                     body = response.json()
                     values = extract_values_from_aql_body(body) if isinstance(body, dict) else (body if isinstance(body, list) else [])
@@ -1105,26 +1207,45 @@ def fetch_objects_by_type_bruteforce(
     return best
 
 
-def get_active_hardware_type_ids() -> list[str]:
-    """Resuelve el scope activo de hardware: parent 211 + descendientes descubiertos."""
-    # En este inventario, los objetos válidos viven bajo 211 + descendientes.
-    # Se ignoran modos alternativos para evitar traer tipos fuera de scope.
+def normalize_type_id_list(values: Any) -> list[str]:
+    """Normaliza listas de type ids y elimina duplicados conservando orden."""
+    normalized: list[str] = []
+    for value in values or []:
+        type_id = str(value or "").strip()
+        if type_id and type_id not in normalized:
+            normalized.append(type_id)
+    return normalized
+
+
+def build_hardware_scope_type_ids(discovered_type_ids: list[str] | None = None) -> list[str]:
+    """Resuelve el scope activo de hardware sin depender de session_state."""
     root_id = str(GENERAL_HARDWARE_TYPE_ID).strip()
-    discovered = [str(x).strip() for x in (st.session_state.get("discovered_type_ids") or []) if str(x).strip()]
-    fallback = [str(x).strip() for x in KNOWN_OBJECT_TYPE_IDS if str(x).strip()]
-    combined: list[str] = [root_id]
-    for type_id in (discovered or fallback):
-        if type_id and type_id not in combined:
+    fallback = normalize_type_id_list(KNOWN_OBJECT_TYPE_IDS)
+    combined = [root_id] if root_id else []
+    for type_id in normalize_type_id_list(discovered_type_ids) or fallback:
+        if type_id not in combined:
             combined.append(type_id)
-    return combined
+    return combined or fallback
 
 
-def get_schema_scan_type_ids() -> list[str]:
+def get_active_hardware_type_ids(discovered_type_ids: list[str] | None = None) -> list[str]:
+    """Resuelve el scope activo de hardware: parent 211 + descendientes descubiertos."""
+    if discovered_type_ids is None:
+        discovered_type_ids = st.session_state.get("discovered_type_ids") or []
+    return build_hardware_scope_type_ids(discovered_type_ids)
+
+
+def get_schema_scan_type_ids(
+    all_schema_type_ids: list[str] | None = None,
+    discovered_type_ids: list[str] | None = None,
+) -> list[str]:
     """Devuelve todos los objectTypeIds del esquema para escaneos de recuperación."""
-    all_schema = [str(x).strip() for x in (st.session_state.get("all_schema_type_ids") or []) if str(x).strip()]
-    if all_schema:
-        return all_schema
-    return get_active_hardware_type_ids()
+    normalized_all = normalize_type_id_list(
+        all_schema_type_ids if all_schema_type_ids is not None else st.session_state.get("all_schema_type_ids") or []
+    )
+    if normalized_all:
+        return normalized_all
+    return build_hardware_scope_type_ids(discovered_type_ids if discovered_type_ids is not None else st.session_state.get("discovered_type_ids") or [])
 
 
 def build_schema_only_aql(aql_query: str) -> str:
@@ -1136,15 +1257,15 @@ def build_schema_only_aql(aql_query: str) -> str:
     return f"{base} AND ({query})"
 
 
-def build_primary_aql(aql_query: str) -> str:
+def build_primary_aql(aql_query: str, type_ids: list[str] | None = None) -> str:
     """Define la consulta primaria según el scope activo."""
     if ASSETS_SCOPE_MODE in {"hardware", "strict_hardware"}:
-        return combine_schema_aql(aql_query)
+        return combine_schema_aql(aql_query, type_ids=type_ids)
     return build_schema_only_aql(aql_query)
 
 
-def combine_schema_aql(aql_query: str) -> str:
-    type_ids = get_active_hardware_type_ids()
+def combine_schema_aql(aql_query: str, type_ids: list[str] | None = None) -> str:
+    type_ids = normalize_type_id_list(type_ids) or get_active_hardware_type_ids()
     hardware_scope = " OR ".join(f"objectTypeId = {type_id}" for type_id in type_ids)
     base = f"objectSchemaId = {SCHEMA_ID} AND ({hardware_scope})"
     query = (aql_query or "").strip()
@@ -2014,7 +2135,13 @@ def clean_asset_object(asset: dict[str, Any]) -> AssetRecord:
     )
 
 
-def enrich_assets_with_object_details(config: AppConfig, auth: BasicAuth, headers: dict[str, str], records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def enrich_assets_with_object_details(
+    config: AppConfig,
+    auth: BasicAuth,
+    headers: dict[str, str],
+    records: list[dict[str, Any]],
+    error_sink: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     if not records:
         return records
 
@@ -2022,18 +2149,21 @@ def enrich_assets_with_object_details(config: AppConfig, auth: BasicAuth, header
         f"{config.site}/gateway/api/jsm/assets/workspace/{config.workspace_id}/v1/object",
         f"{config.site}/rest/servicedeskapi/assets/workspace/{config.workspace_id}/v1/object",
     ]
-    cache: dict[str, dict[str, Any]] = {}
-    enriched: list[dict[str, Any]] = []
+    results_by_index: dict[int, dict[str, Any]] = {}
+    grouped_to_fetch: dict[str, list[tuple[int, dict[str, Any]]]] = {}
 
-    for record in records:
+    for idx, record in enumerate(records):
+        if bool(record.get("attrs_by_name") or record.get("attrs_by_id")):
+            results_by_index[idx] = record
+            continue
         object_id = str(record.get("object_id") or "").strip()
         if not object_id:
-            enriched.append(record)
+            results_by_index[idx] = record
             continue
-        if object_id in cache:
-            enriched.append(cache[object_id])
-            continue
+        grouped_to_fetch.setdefault(object_id, []).append((idx, record))
 
+    def fetch_detail_for_object(object_id: str, seed_record: dict[str, Any]) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+        local_errors: list[dict[str, Any]] = []
         detail_body = None
         for base_url in urls:
             try:
@@ -2043,6 +2173,7 @@ def enrich_assets_with_object_details(config: AppConfig, auth: BasicAuth, header
                     auth=auth,
                     headers=headers,
                     params={"includeAttributes": "true"},
+                    error_sink=local_errors,
                 )
                 detail_body = response.json()
                 break
@@ -2052,26 +2183,68 @@ def enrich_assets_with_object_details(config: AppConfig, auth: BasicAuth, header
         if isinstance(detail_body, dict) and detail_body.get("attributes"):
             detailed = clean_asset_object(detail_body).to_dict()
             if not detailed.get("jira_key"):
-                detailed["jira_key"] = record.get("jira_key", "")
-            cache[object_id] = detailed
-            enriched.append(detailed)
-        else:
-            cache[object_id] = record
-            enriched.append(record)
+                detailed["jira_key"] = seed_record.get("jira_key", "")
+            return object_id, detailed, local_errors
+        return object_id, seed_record, local_errors
 
-    return enriched
+    if grouped_to_fetch:
+        max_workers = max(1, min(len(grouped_to_fetch), 6))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(fetch_detail_for_object, object_id, grouped[0][1]): object_id
+                for object_id, grouped in grouped_to_fetch.items()
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                object_id = future_map[future]
+                try:
+                    _, detailed_record, local_errors = future.result()
+                except Exception:
+                    detailed_record = grouped_to_fetch[object_id][0][1]
+                    local_errors = []
+                if error_sink is not None and local_errors:
+                    error_sink.extend(local_errors)
+                for idx, original in grouped_to_fetch[object_id]:
+                    result = dict(detailed_record)
+                    if not result.get("jira_key"):
+                        result["jira_key"] = original.get("jira_key", "")
+                    results_by_index[idx] = result
+
+    return [results_by_index.get(idx, records[idx]) for idx in range(len(records))]
 
 
-def fetch_assets(config: AppConfig, aql_query: str = "") -> list[dict[str, Any]]:
+def apply_fetch_metadata(metadata: dict[str, int]) -> None:
+    """Vuelca diagnósticos de carga al session_state en el hilo principal."""
+    for key, value in metadata.items():
+        st.session_state[key] = value
+
+
+def fetch_assets_backend(
+    config: AppConfig,
+    aql_query: str = "",
+    *,
+    discovered_type_ids: list[str] | None = None,
+    all_schema_type_ids: list[str] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, int], list[dict[str, Any]]]:
     if not config.workspace_id:
         raise RuntimeError("Falta ASSETS_WORKSPACE_ID/JIRA_WORKSPACE_ID en el entorno.")
 
+    debug_log(f"fetch_assets:start aql={aql_query!r}")
     auth, headers = build_auth_headers(config)
-    active_scope_type_ids = {str(x).strip() for x in get_active_hardware_type_ids() if str(x).strip()}
+    error_events: list[dict[str, Any]] = []
+    metadata: dict[str, int] = {
+        "last_base_records_count": 0,
+        "last_segmented_records_count": 0,
+        "last_bruteforce_records_count": 0,
+        "last_type_scan_checked": 0,
+        "last_type_scan_hits": 0,
+    }
+    active_scope_type_ids = get_active_hardware_type_ids(discovered_type_ids)
+    active_scope_type_id_set = {type_id for type_id in active_scope_type_ids if type_id}
+    scan_scope_type_ids = get_schema_scan_type_ids(all_schema_type_ids, active_scope_type_ids)
     if ASSETS_SCOPE_MODE in {"hardware", "strict_hardware"}:
-        scan_type_ids = [str(x).strip() for x in get_active_hardware_type_ids() if str(x).strip()]
+        scan_type_ids = list(active_scope_type_ids)
     else:
-        scan_type_ids = [str(x).strip() for x in get_schema_scan_type_ids() if str(x).strip()]
+        scan_type_ids = list(scan_scope_type_ids)
 
     def fetch_by_full_query(full_ql_query: str) -> tuple[list[dict[str, Any]], Exception | None]:
         try:
@@ -2080,13 +2253,26 @@ def fetch_assets(config: AppConfig, aql_query: str = "") -> list[dict[str, Any]]
         except Exception as exc:
             return [], exc
 
-    base_full_query = build_primary_aql(aql_query)
+    base_full_query = build_primary_aql(aql_query, type_ids=active_scope_type_ids)
     base_records, last_error = fetch_by_full_query(base_full_query)
-    st.session_state["last_base_records_count"] = len(base_records)
-    st.session_state["last_bruteforce_records_count"] = 0
+    metadata["last_base_records_count"] = len(base_records)
+    debug_log(f"fetch_assets:base_done count={len(base_records)} error={bool(last_error)}")
 
-    final_records = base_records
-    if True:
+    base_is_sufficient = bool(base_records)
+    recovery_allowed = (
+        SEGMENTED_FETCH_ENABLED
+        and not str(aql_query or "").strip()
+        and len(base_records) < max(1, int(FORCE_FETCH_MIN_ASSETS))
+    )
+    if base_is_sufficient or not recovery_allowed:
+        debug_log(
+            "fetch_assets:using_base "
+            f"count={len(base_records)} recovery_allowed={recovery_allowed}"
+        )
+        metadata["last_segmented_records_count"] = len(base_records)
+        final_records = base_records
+    else:
+        debug_log(f"fetch_assets:recovery_start base_count={len(base_records)}")
         merged: dict[str, dict[str, Any]] = {}
         for record in base_records:
             key = str(record.get("object_id") or record.get("jira_key") or record.get("name") or id(record))
@@ -2095,7 +2281,10 @@ def fetch_assets(config: AppConfig, aql_query: str = "") -> list[dict[str, Any]]
         try:
             segmented_results: list[list[dict[str, Any]]] = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(scan_type_ids), 8))) as executor:
-                futures = [executor.submit(fetch_type_sync, config, auth, headers, type_id, aql_query) for type_id in scan_type_ids]
+                futures = [
+                    executor.submit(fetch_type_sync, config, auth, headers, type_id, aql_query, active_scope_type_ids)
+                    for type_id in scan_type_ids
+                ]
                 for future in concurrent.futures.as_completed(futures):
                     try:
                         segmented_results.append(future.result())
@@ -2110,7 +2299,7 @@ def fetch_assets(config: AppConfig, aql_query: str = "") -> list[dict[str, Any]]
             last_error = exc
 
         final_records = list(merged.values())
-        st.session_state["last_segmented_records_count"] = len(merged)
+        metadata["last_segmented_records_count"] = len(merged)
 
         should_force_bruteforce = (
             FORCE_FETCH_ENABLED
@@ -2119,15 +2308,20 @@ def fetch_assets(config: AppConfig, aql_query: str = "") -> list[dict[str, Any]]
         )
         if should_force_bruteforce:
             brute_results: list[list[dict[str, Any]]] = []
+
+            def fetch_bruteforce_worker(type_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+                worker_errors: list[dict[str, Any]] = []
+                rows = fetch_objects_by_type_bruteforce(config, auth, headers, type_id, error_sink=worker_errors)
+                return rows, worker_errors
+
             try:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(len(scan_type_ids), 8))) as executor:
-                    futures = [
-                        executor.submit(fetch_objects_by_type_bruteforce, config, auth, headers, type_id)
-                        for type_id in scan_type_ids
-                    ]
+                    futures = [executor.submit(fetch_bruteforce_worker, type_id) for type_id in scan_type_ids]
                     for future in concurrent.futures.as_completed(futures):
                         try:
-                            brute_results.append(future.result())
+                            rows, worker_errors = future.result()
+                            error_events.extend(worker_errors)
+                            brute_results.append(rows)
                         except Exception as exc:
                             last_error = exc
             except Exception as exc:
@@ -2138,30 +2332,28 @@ def fetch_assets(config: AppConfig, aql_query: str = "") -> list[dict[str, Any]]
                     key = str(record.get("object_id") or record.get("jira_key") or record.get("name") or id(record))
                     merged[key] = record
 
-            st.session_state["last_bruteforce_records_count"] = max(0, len(merged) - int(st.session_state.get("last_segmented_records_count", 0)))
+            metadata["last_bruteforce_records_count"] = max(0, len(merged) - int(metadata.get("last_segmented_records_count", 0)))
             final_records = list(merged.values())
-            st.session_state["last_segmented_records_count"] = len(merged)
+            metadata["last_segmented_records_count"] = len(merged)
 
-            # Fuerza bruta adicional: escaneo de rango de objectTypeId por si faltan subtipos en el discovery.
-            st.session_state["last_type_scan_checked"] = 0
-            st.session_state["last_type_scan_hits"] = 0
             if TYPE_SCAN_ENABLED and len(merged) < max(1, int(FORCE_FETCH_MIN_ASSETS)):
                 scan_start = min(TYPE_SCAN_START, TYPE_SCAN_END)
                 scan_end = max(TYPE_SCAN_START, TYPE_SCAN_END)
                 scan_ids = [str(x) for x in range(scan_start, scan_end + 1)]
                 skip = {str(x).strip() for x in scan_type_ids if str(x).strip()}
                 scan_ids = [type_id for type_id in scan_ids if type_id not in skip]
-                st.session_state["last_type_scan_checked"] = len(scan_ids)
+                metadata["last_type_scan_checked"] = len(scan_ids)
                 scan_hits = 0
                 try:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
                         future_map = {
-                            executor.submit(fetch_objects_by_type_bruteforce, config, auth, headers, type_id): type_id
+                            executor.submit(fetch_bruteforce_worker, type_id): type_id
                             for type_id in scan_ids
                         }
                         for future in concurrent.futures.as_completed(future_map):
                             try:
-                                rows = future.result()
+                                rows, worker_errors = future.result()
+                                error_events.extend(worker_errors)
                             except Exception:
                                 continue
                             if not rows:
@@ -2172,10 +2364,10 @@ def fetch_assets(config: AppConfig, aql_query: str = "") -> list[dict[str, Any]]
                                 merged[key] = record
                 except Exception as exc:
                     last_error = exc
-                st.session_state["last_type_scan_hits"] = scan_hits
-                st.session_state["last_bruteforce_records_count"] = max(0, len(merged) - int(st.session_state.get("last_segmented_records_count", 0)))
+                metadata["last_type_scan_hits"] = scan_hits
+                metadata["last_bruteforce_records_count"] = max(0, len(merged) - int(metadata.get("last_segmented_records_count", 0)))
                 final_records = list(merged.values())
-                st.session_state["last_segmented_records_count"] = len(merged)
+                metadata["last_segmented_records_count"] = len(merged)
 
     if not final_records and last_error is not None:
         raise RuntimeError(f"No se pudo consultar Jira Assets: {last_error}")
@@ -2183,10 +2375,31 @@ def fetch_assets(config: AppConfig, aql_query: str = "") -> list[dict[str, Any]]
     if ASSETS_SCOPE_MODE == "strict_hardware":
         final_records = [
             record for record in final_records
-            if str(record.get("object_type_id") or "").strip() in active_scope_type_ids
+            if str(record.get("object_type_id") or "").strip() in active_scope_type_id_set
         ]
 
-    return enrich_assets_with_object_details(config, auth, headers, final_records)
+    debug_log(f"fetch_assets:before_enrich count={len(final_records)}")
+    enriched = enrich_assets_with_object_details(config, auth, headers, final_records, error_sink=error_events)
+    debug_log(f"fetch_assets:after_enrich count={len(enriched)}")
+    debug_log(
+        "fetch_assets:end "
+        f"base={len(base_records)} final={len(final_records)} enriched={len(enriched)} "
+        f"segmented={metadata['last_segmented_records_count']} "
+        f"bruteforce={metadata['last_bruteforce_records_count']}"
+    )
+    return enriched, metadata, error_events
+
+
+def fetch_assets(config: AppConfig, aql_query: str = "") -> list[dict[str, Any]]:
+    assets, metadata, error_events = fetch_assets_backend(
+        config,
+        aql_query,
+        discovered_type_ids=st.session_state.get("discovered_type_ids") or KNOWN_OBJECT_TYPE_IDS,
+        all_schema_type_ids=st.session_state.get("all_schema_type_ids") or [],
+    )
+    apply_fetch_metadata(metadata)
+    append_error_events(error_events)
+    return assets
 
 
 def compute_cache_hash(config: AppConfig, aql_query: str) -> str:
@@ -2195,20 +2408,90 @@ def compute_cache_hash(config: AppConfig, aql_query: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def cached_fetch_assets(config: AppConfig, aql_query: str, ttl_minutes: int) -> list[dict[str, Any]]:
+def cached_fetch_assets(config: AppConfig, aql_query: str, ttl_minutes: int, *, force_live: bool = False) -> list[dict[str, Any]]:
     """Resuelve caché de assets con invalidación por hash y vencimiento."""
+    discovered_snapshot = normalize_type_id_list(st.session_state.get("discovered_type_ids") or KNOWN_OBJECT_TYPE_IDS)
+    all_schema_snapshot = normalize_type_id_list(st.session_state.get("all_schema_type_ids") or [])
     cache_hash = compute_cache_hash(config, aql_query)
     now = datetime.now()
     expiry = st.session_state.get("cache_expiry")
     current_hash = st.session_state.get("cache_hash")
     if (
-        st.session_state.get("assets")
+        not force_live
+        and st.session_state.get("assets")
         and current_hash == cache_hash
         and isinstance(expiry, datetime)
         and now < expiry
     ):
         return st.session_state["assets"]
-    assets = fetch_assets(config, aql_query)
+    process_now = time.time()
+    with PROCESS_FETCH_LOCK:
+        cached = PROCESS_FETCH_RESULTS.get(cache_hash)
+        if (
+            not force_live
+            and cached
+            and (process_now - cached[0]) < min(int(ttl_minutes * 60), PROCESS_FETCH_CACHE_TTL_SECONDS)
+        ):
+            _, cached_assets, cached_metadata, cached_errors = cached
+            debug_log(f"cached_fetch_assets:process_cache_hit hash={cache_hash[:8]}")
+            apply_fetch_metadata(cached_metadata)
+            append_error_events(copy.deepcopy(cached_errors))
+            assets = copy.deepcopy(cached_assets)
+            st.session_state["cache_hash"] = cache_hash
+            st.session_state["cache_expiry"] = now + timedelta(minutes=ttl_minutes)
+            return assets
+
+    if not force_live:
+        snapshot_assets, snapshot_metadata, snapshot_saved_at = load_assets_snapshot()
+        if snapshot_assets:
+            debug_log(f"cached_fetch_assets:snapshot_hit count={len(snapshot_assets)} hash={cache_hash[:8]}")
+            apply_fetch_metadata({k: int(v or 0) for k, v in snapshot_metadata.items() if isinstance(v, (int, str))})
+            st.session_state["cache_hash"] = cache_hash
+            st.session_state["cache_expiry"] = now + timedelta(minutes=ttl_minutes)
+            if isinstance(snapshot_saved_at, datetime):
+                st.session_state["last_sync"] = snapshot_saved_at
+            return copy.deepcopy(snapshot_assets)
+
+    with PROCESS_FETCH_LOCK:
+        future = PROCESS_FETCH_JOBS.get(cache_hash)
+        if future is None:
+            config_snapshot = config_to_cache_key(config)
+            debug_log(f"cached_fetch_assets:submit hash={cache_hash[:8]}")
+            future = PROCESS_FETCH_EXECUTOR.submit(
+                fetch_assets_backend,
+                config_from_cache_key(config_snapshot),
+                aql_query,
+                discovered_type_ids=discovered_snapshot,
+                all_schema_type_ids=all_schema_snapshot,
+            )
+            PROCESS_FETCH_JOBS[cache_hash] = future
+        else:
+            debug_log(f"cached_fetch_assets:reuse_inflight hash={cache_hash[:8]}")
+
+    try:
+        assets, metadata, error_events = future.result()
+    except Exception:
+        with PROCESS_FETCH_LOCK:
+            current_future = PROCESS_FETCH_JOBS.get(cache_hash)
+            if current_future is future:
+                PROCESS_FETCH_JOBS.pop(cache_hash, None)
+        raise
+
+    with PROCESS_FETCH_LOCK:
+        PROCESS_FETCH_RESULTS[cache_hash] = (
+            time.time(),
+            copy.deepcopy(assets),
+            dict(metadata),
+            copy.deepcopy(error_events),
+        )
+        current_future = PROCESS_FETCH_JOBS.get(cache_hash)
+        if current_future is future:
+            PROCESS_FETCH_JOBS.pop(cache_hash, None)
+
+    apply_fetch_metadata(metadata)
+    append_error_events(error_events)
+    if assets:
+        save_assets_snapshot(assets, metadata)
     st.session_state["cache_hash"] = cache_hash
     st.session_state["cache_expiry"] = now + timedelta(minutes=ttl_minutes)
     return assets
@@ -2216,6 +2499,20 @@ def cached_fetch_assets(config: AppConfig, aql_query: str, ttl_minutes: int) -> 
 
 def detect_category_from_prompt(prompt: str) -> str | None:
     text = normalize_text(prompt)
+    if any(
+        phrase in text
+        for phrase in [
+            "a quien",
+            "a quién",
+            "quien tiene",
+            "quién tiene",
+            "de quien",
+            "de quién",
+            "que tiene asignado",
+            "qué tiene asignado",
+        ]
+    ):
+        return None
     for alias, canonical in CATEGORY_ALIAS_TO_CANONICAL.items():
         if alias in text:
             return canonical
@@ -3011,15 +3308,45 @@ def _read_json_file(path: Path, default: Any) -> Any:
         if not path.exists():
             return default
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as exc:
+        push_app_error("_read_json_file", f"{path.name}: {exc}")
         return default
 
 
-def _write_json_file(path: Path, payload: Any) -> None:
+def _write_json_file(path: Path, payload: Any) -> bool:
     try:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        return
+        return True
+    except Exception as exc:
+        push_app_error("_write_json_file", f"{path.name}: {exc}")
+        return False
+
+
+def load_assets_snapshot() -> tuple[list[dict[str, Any]], dict[str, int], datetime | None]:
+    payload = _read_json_file(ASSETS_SNAPSHOT_FILE, {})
+    if not isinstance(payload, dict):
+        return [], {}, None
+    assets = payload.get("assets") if isinstance(payload.get("assets"), list) else []
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    saved_at_raw = str(payload.get("saved_at") or "").strip()
+    saved_at = None
+    if saved_at_raw:
+        try:
+            saved_at = datetime.fromisoformat(saved_at_raw)
+        except ValueError:
+            saved_at = None
+    return assets, metadata, saved_at
+
+
+def save_assets_snapshot(assets: list[dict[str, Any]], metadata: dict[str, int]) -> bool:
+    return _write_json_file(
+        ASSETS_SNAPSHOT_FILE,
+        {
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "assets": assets,
+            "metadata": metadata,
+        },
+    )
 
 
 def load_auto_assign_rules() -> list[dict[str, Any]]:
@@ -3027,8 +3354,8 @@ def load_auto_assign_rules() -> list[dict[str, Any]]:
     return data if isinstance(data, list) else []
 
 
-def save_auto_assign_rules(rules: list[dict[str, Any]]) -> None:
-    _write_json_file(AUTO_ASSIGN_RULES_FILE, rules)
+def save_auto_assign_rules(rules: list[dict[str, Any]]) -> bool:
+    return _write_json_file(AUTO_ASSIGN_RULES_FILE, rules)
 
 
 def load_auto_assign_log() -> list[dict[str, Any]]:
@@ -3038,8 +3365,12 @@ def load_auto_assign_log() -> list[dict[str, Any]]:
     return data[-100:]
 
 
-def save_auto_assign_log(rows: list[dict[str, Any]]) -> None:
-    _write_json_file(AUTO_ASSIGN_LOG_FILE, rows[-100:])
+def save_auto_assign_log(rows: list[dict[str, Any]]) -> bool:
+    return _write_json_file(AUTO_ASSIGN_LOG_FILE, rows[-100:])
+
+
+def save_normalization_rules(rules: list[dict[str, Any]]) -> bool:
+    return _write_json_file(RULES_FILE, rules)
 
 
 def _get_asset_condition_value(asset: dict[str, Any], campo: str) -> str:
@@ -3299,6 +3630,24 @@ def parse_normalization_rule_from_prompt(prompt: str) -> ReglaNormalizacion | No
             descripcion=f"hostname contiene '{normalize_lookup_key(token)}' => {campo_destino}='{valor_nuevo}'",
         )
 
+    p_simple = re.search(
+        r"(?:los|las|equipos|hosts?|hostnames?)\s+(?:que\s+)?(?:empiezan?\s+con\s+|empiecen\s+con\s+|empezando\s+con\s+)?([A-Z]{2,}[A-Z0-9]*)\s+son\s+de\s+(.+)$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if p_simple:
+        token = p_simple.group(1).strip()
+        destino = p_simple.group(2).strip()
+        campo_destino, valor_nuevo = _destino(destino)
+        return ReglaNormalizacion(
+            campo_condicion="hostname",
+            operador="empieza_con",
+            valor_condicion=normalize_lookup_key(token),
+            campo_a_modificar=campo_destino,
+            valor_nuevo=valor_nuevo,
+            descripcion=f"hostname empieza_con '{normalize_lookup_key(token)}' => {campo_destino}='{valor_nuevo}'",
+        )
+
     return None
 
 
@@ -3381,9 +3730,13 @@ def evaluar_regla(asset: dict[str, Any], regla: ReglaNormalizacion) -> bool:
     trg = target.lower()
 
     if regla.operador == "empieza_con":
-        return src.startswith(trg) or any(
-            p.lower().startswith(trg) for p in valor_campo.split() if p
-        )
+        if campo == "hostname":
+            candidates = []
+            for part in valor_campo.split():
+                if part:
+                    candidates.append(part)
+            return any(candidate.lower().startswith(trg) for candidate in candidates)
+        return src.startswith(trg) or any(p.lower().startswith(trg) for p in valor_campo.split() if p)
     if regla.operador == "termina_con":
         return src.endswith(trg) or any(
             p.lower().endswith(trg) for p in valor_campo.split() if p
@@ -3458,7 +3811,7 @@ def answer_inventory_question(assets: list[dict[str, Any]], prompt: str) -> str:
     mail_match = re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", prompt)
     if mail_match and not filters.get("assignee"):
         filters["assignee"] = mail_match.group(0)
-    selected = apply_filters(assets, filters) if filters else assets
+    selected = list(apply_filters(assets, filters)) if filters else list(assets)
 
     def _owner_by_identifier() -> str | None:
         ident = parse_assignee_of_identifier_query(prompt)
@@ -3671,9 +4024,21 @@ def answer_inventory_question(assets: list[dict[str, Any]], prompt: str) -> str:
         return f"ℹ️ Hay **{len(missing_rows)}** activos sin hostname."
 
     def _generic_count() -> str | None:
-        if not any(k in t for k in ["cuantos", "cuántos", "cantidad", "total"]):
+        count_keywords = ["cuantos", "cuántos", "cantidad", "total", "hay", "tenemos", "existen"]
+        if not any(k in t for k in count_keywords):
             return None
-        return f"ℹ️ Encontré **{len(selected)}** activos para ese criterio."
+        category_info = f" de {filters['category']}" if filters.get("category") else ""
+        country_info = f" en {filters['country']}" if filters.get("country") else ""
+        status_info = f" con estado {filters['status']}" if filters.get("status") else ""
+        preview = ""
+        if selected:
+            preview = "\n".join(
+                [
+                    f"- {a.get('jira_key') or a.get('name')} | {a.get('status')} | {a.get('assigned_to') or 'Sin asignar'}"
+                    for a in selected[:10]
+                ]
+            )
+        return f"ℹ️ Hay **{len(selected)}** activos{category_info}{country_info}{status_info}.\n\n{preview}".strip()
 
     def _general() -> str:
         lines = [f"ℹ️ Encontré **{len(selected)}** activos. Muestra:"]
@@ -3725,81 +4090,110 @@ def parse_nl_dashboard_request(prompt: str) -> dict[str, Any]:
 
 def build_dashboard_chat_payload(assets: list[dict[str, Any]], prompt: str) -> str:
     request = parse_nl_dashboard_request(prompt)
-    working_assets = apply_filters(assets, request.get("filters", {})) if request else assets
-    total = len(working_assets)
+    working = apply_filters(assets, request.get("filters", {})) if request else assets
+    total = len(working)
     if total == 0:
-        return encode_chat_payload("ℹ️ No encontré activos para construir ese dashboard.")
+        return encode_chat_payload("No encontré activos para ese dashboard.")
     if pd is None or px is None or pio is None:
-        return encode_chat_payload("ℹ️ El dashboard requiere `pandas`, `plotly.express` y `plotly.io` instalados.")
+        return encode_chat_payload("Instalá `pandas` y `plotly` para dashboards visuales.")
 
-    base_rows = [
-        {
-            "País": a.get("country") or "Sin país",
-            "Compañía": a.get("company") or "Sin compañía",
-            "Categoría": a.get("category") or "Sin categoría",
-            "Estado": a.get("status") or "Sin estado",
-            "Asignado": "Sí" if str(a.get("assigned_to") or "").strip() else "No",
-            "Serial": "Sí" if str(get_serial_value(a)).strip() else "No",
-            "Hostname": "Sí" if str(get_hostname_value(a)).strip() else "No",
-            "Modelo": "Sí" if str(a.get("model") or "").strip() else "No",
-            "Costo": "Sí" if parse_cost(str(a.get("purchase_price", ""))) > 0 else "No",
-        }
-        for a in working_assets
-    ]
-    df = pd.DataFrame(base_rows)
+    in_use = sum(1 for a in working if normalize_text(a.get("status", "")) == "en uso")
+    stock = sum(1 for a in working if "stock" in normalize_text(a.get("status", "")))
+    sin_serial = sum(1 for a in working if not str(a.get("serial_number", "")).strip())
+    sin_asignar = sum(1 for a in working if not str(a.get("assigned_to") or "").strip())
+    costo = round(sum(parse_cost(str(a.get("purchase_price", ""))) for a in working), 2)
 
-    sunburst_df = (
-        df.groupby(["País", "Compañía", "Categoría"], dropna=False)
-        .size()
-        .reset_index(name="Cantidad")
+    kpi_text = (
+        f"**Dashboard — {total} activos**\n\n"
+        f"| Métrica | Valor | % |\n|---|---|---|\n"
+        f"| En uso | {in_use} | {round(in_use / max(total, 1) * 100, 1)}% |\n"
+        f"| Stock disponible | {stock} | {round(stock / max(total, 1) * 100, 1)}% |\n"
+        f"| Sin asignar | {sin_asignar} | {round(sin_asignar / max(total, 1) * 100, 1)}% |\n"
+        f"| Sin serial | {sin_serial} | {round(sin_serial / max(total, 1) * 100, 1)}% |\n"
+        f"| Costo total | ${costo:,.0f} | — |"
     )
-    fig_sunburst = px.sunburst(
-        sunburst_df,
+
+    layout = dict(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(size=12),
+        margin=dict(t=50, b=30, l=10, r=10),
+    )
+    color_map = {
+        "En uso": "#0f766e",
+        "Stock nuevo": "#334155",
+        "Stock usado": "#78716c",
+        "Asignado al edificio": "#64748b",
+        "Sin estado": "#cbd5e1",
+    }
+
+    charts: list[dict[str, Any]] = []
+    geo_df = pd.DataFrame(
+        [{"País": a.get("country") or "Sin país", "Compañía": a.get("company") or "Sin compañía", "Categoría": a.get("category") or "Sin cat"} for a in working]
+    )
+    sun_df = geo_df.groupby(["País", "Compañía", "Categoría"]).size().reset_index(name="Cantidad")
+    fig1 = px.sunburst(
+        sun_df,
         path=["País", "Compañía", "Categoría"],
         values="Cantidad",
-        color="Cantidad",
-        color_continuous_scale=["#0b0f19", "#00f3ff", "#ff003c"],
+        title="Distribución País → Compañía → Categoría",
+        color_discrete_sequence=["#111827", "#334155", "#475569", "#64748b", "#94a3b8", "#cbd5e1"],
     )
-    fig_sunburst.update_layout(margin=dict(t=40, l=0, r=0, b=0), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    fig1.update_traces(textinfo="label+percent parent")
+    fig1.update_layout(**layout)
+    charts.append({"title": "Distribución geográfica", "figure_json": fig1.to_json()})
 
-    heatmap_df = df.groupby(["Categoría", "Estado"], dropna=False).size().reset_index(name="Cantidad")
-    fig_heatmap = px.density_heatmap(
-        heatmap_df,
+    estado_df = pd.DataFrame([{"Categoría": a.get("category") or "Sin cat", "Estado": a.get("status") or "Sin estado"} for a in working])
+    est_count = estado_df.groupby(["Categoría", "Estado"]).size().reset_index(name="Cantidad")
+    fig2 = px.bar(
+        est_count,
         x="Categoría",
-        y="Estado",
-        z="Cantidad",
-        histfunc="sum",
-        color_continuous_scale=["#0b0f19", "#00f3ff", "#ff003c"],
+        y="Cantidad",
+        color="Estado",
+        barmode="stack",
+        title="Estado por Categoría de activo",
+        color_discrete_map=color_map,
+        text_auto=True,
     )
-    fig_heatmap.update_layout(margin=dict(t=40, l=0, r=0, b=0), paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    fig2.update_layout(**layout, xaxis=dict(gridcolor="rgba(0,0,0,0.06)"), yaxis=dict(gridcolor="rgba(0,0,0,0.06)"))
+    charts.append({"title": "Estado por categoría", "figure_json": fig2.to_json()})
 
-    quality_rows = [
-        {"Dimensión": "Serial", "Score": round((df["Serial"] == "Sí").mean() * 100, 2)},
-        {"Dimensión": "Hostname", "Score": round((df["Hostname"] == "Sí").mean() * 100, 2)},
-        {"Dimensión": "Estado", "Score": round((df["Estado"] != "Sin estado").mean() * 100, 2)},
-        {"Dimensión": "Asignado", "Score": round((df["Asignado"] == "Sí").mean() * 100, 2)},
-        {"Dimensión": "Modelo", "Score": round((df["Modelo"] == "Sí").mean() * 100, 2)},
-        {"Dimensión": "Costo", "Score": round((df["Costo"] == "Sí").mean() * 100, 2)},
-    ]
-    radar_df = pd.DataFrame(quality_rows)
-    fig_radar = px.line_polar(radar_df, r="Score", theta="Dimensión", line_close=True)
-    fig_radar.update_traces(fill="toself", line_color="#00f3ff")
-    fig_radar.update_layout(
-        margin=dict(t=40, l=0, r=0, b=0),
-        paper_bgcolor="rgba(0,0,0,0)",
-        polar=dict(bgcolor="rgba(0,0,0,0)", radialaxis=dict(range=[0, 100], gridcolor="rgba(255,255,255,0.18)")),
+    quality = {
+        "Serial": sum(1 for a in working if get_serial_value(a)),
+        "Hostname": sum(1 for a in working if get_hostname_value(a)),
+        "Modelo": sum(1 for a in working if a.get("model")),
+        "Costo": sum(1 for a in working if parse_cost(str(a.get("purchase_price", "")))),
+        "País": sum(1 for a in working if a.get("country") and a.get("country") != "Sin país"),
+        "Garantía": sum(1 for a in working if a.get("warranty_date")),
+    }
+    q_df = pd.DataFrame([{"Campo": k, "Score": round(v / max(total, 1) * 100, 1)} for k, v in quality.items()]).sort_values("Score")
+    fig3 = px.bar(
+        q_df,
+        x="Score",
+        y="Campo",
+        orientation="h",
+        title="Data Quality Score (%)",
+        text="Score",
+        color="Score",
+        color_continuous_scale=["#e7e5e4", "#94a3b8", "#0f766e"],
+        range_color=[0, 100],
     )
+    fig3.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+    fig3.update_layout(**layout, xaxis=dict(range=[0, 115]), coloraxis_showscale=False)
+    charts.append({"title": "Data Quality", "figure_json": fig3.to_json()})
 
-    text = (
-        f"ℹ️ Dashboard generado sobre **{total}** activos."
-        f" Países: **{df['País'].nunique()}** | compañías: **{df['Compañía'].nunique()}** | categorías: **{df['Categoría'].nunique()}**."
-    )
-    charts = [
-        {"title": "Sunburst País > Compañía > Categoría", "figure_json": fig_sunburst.to_json()},
-        {"title": "Heatmap Categoría vs Estado", "figure_json": fig_heatmap.to_json()},
-        {"title": "Radar de Data Quality", "figure_json": fig_radar.to_json()},
-    ]
-    return encode_chat_payload(text, charts)
+    costo_rows = [(a.get("country") or "Sin país", parse_cost(str(a.get("purchase_price", "")))) for a in working]
+    costo_rows = [(p, c) for p, c in costo_rows if c > 0]
+    if costo_rows:
+        costo_por_pais: dict[str, float] = {}
+        for pais, amount in costo_rows:
+            costo_por_pais[pais] = costo_por_pais.get(pais, 0) + amount
+        cp_df = pd.DataFrame([{"País": k, "Inversión": round(v, 0)} for k, v in costo_por_pais.items()]).sort_values("Inversión", ascending=False)
+        fig4 = px.bar(cp_df, x="País", y="Inversión", title="Inversión total por País", text_auto=".2s", color="Inversión", color_continuous_scale=["#e7e5e4", "#334155"])
+        fig4.update_layout(**layout, coloraxis_showscale=False)
+        charts.append({"title": "Inversión por país", "figure_json": fig4.to_json()})
+
+    return encode_chat_payload(kpi_text, charts)
 
 
 def run_nl_coverage_test(assets: list[dict[str, Any]]) -> dict[str, Any]:
@@ -3875,6 +4269,7 @@ def ensure_session_state() -> None:
     st.session_state.setdefault("last_bruteforce_records_count", 0)
     st.session_state.setdefault("last_type_scan_checked", 0)
     st.session_state.setdefault("last_type_scan_hits", 0)
+    st.session_state.setdefault("auto_reset_empty_once", False)
     if not st.session_state["movimientos"]:
         movement_path = MOVEMENTS_FILE
         if movement_path.exists():
@@ -3906,144 +4301,259 @@ def ensure_session_state() -> None:
         st.session_state["auto_assign_log"] = load_auto_assign_log()
 
 
-def refresh_assets(config: AppConfig, aql_query: str = "") -> None:
+def refresh_assets(config: AppConfig, aql_query: str = "", *, force_live: bool = False) -> None:
     """Refresca inventario desde Jira aplicando caché configurable."""
+    debug_log(f"refresh_assets:start aql={aql_query!r} force_live={force_live}")
     with st.spinner("Consultando Jira Assets de Uala..."):
-        try:
-            discovered = fetch_schema_object_type_ids(config, SCHEMA_ID)
-            all_schema_types = fetch_all_schema_object_type_ids(config, SCHEMA_ID)
-            st.session_state["all_schema_type_ids"] = all_schema_types
-            if discovered:
-                st.session_state["discovered_type_ids"] = discovered
-                st.session_state["type_discovery_source"] = "api"
-                st.session_state["type_discovery_error"] = ""
-            else:
-                st.session_state["discovered_type_ids"] = KNOWN_OBJECT_TYPE_IDS
-                st.session_state["type_discovery_source"] = "fallback"
-                st.session_state["type_discovery_error"] = "Sin resultados en endpoint de objecttypes."
-        except Exception as exc:
-            st.session_state["discovered_type_ids"] = KNOWN_OBJECT_TYPE_IDS
+        cached_discovered = normalize_type_id_list(st.session_state.get("discovered_type_ids") or [])
+        if not cached_discovered:
+            st.session_state["discovered_type_ids"] = normalize_type_id_list(KNOWN_OBJECT_TYPE_IDS)
             st.session_state["type_discovery_source"] = "fallback"
-            st.session_state["type_discovery_error"] = str(exc)
+            st.session_state["type_discovery_error"] = ""
+
+        cached_all_schema = normalize_type_id_list(st.session_state.get("all_schema_type_ids") or [])
+        if not cached_all_schema:
+            st.session_state["all_schema_type_ids"] = get_schema_scan_type_ids(
+                all_schema_type_ids=KNOWN_OBJECT_TYPE_IDS,
+                discovered_type_ids=st.session_state.get("discovered_type_ids") or KNOWN_OBJECT_TYPE_IDS,
+            )
         ttl = int(st.session_state.get("cache_ttl_minutes", 10))
         t0 = time.perf_counter()
-        st.session_state.assets = cached_fetch_assets(config, aql_query, ttl)
+        st.session_state.assets = cached_fetch_assets(config, aql_query, ttl, force_live=force_live)
         st.session_state.last_load_seconds = round(time.perf_counter() - t0, 3)
-        st.session_state.last_aql_executed = build_primary_aql(aql_query)
+        st.session_state.last_aql_executed = build_primary_aql(
+            aql_query,
+            type_ids=get_active_hardware_type_ids(st.session_state.get("discovered_type_ids") or KNOWN_OBJECT_TYPE_IDS),
+        )
         st.session_state.last_sync = datetime.now()
         st.session_state.anomaly_report = run_anomaly_detection(st.session_state.assets)
         st.session_state.last_error = ""
-
-
-def apply_theme(theme_name: str) -> None:
-    theme = THEMES.get(theme_name, THEMES["Oscuro "])
-    accent_alt = theme.get("accent_alt", theme["accent"])
-    st.markdown(
-        f"""
-        <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=Roboto+Mono:wght@400;600&display=swap');
-        .stApp {{
-            background: {theme["bg"]};
-            color: {theme["text"]};
-            background-image:
-                radial-gradient(circle at 15% 20%, {theme["accent"]}18 0, transparent 26%),
-                radial-gradient(circle at 85% 12%, {accent_alt}14 0, transparent 24%),
-                linear-gradient(180deg, {theme["bg"]} 0%, color-mix(in srgb, {theme["bg"]} 88%, #000 12%) 100%);
-            font-family: 'Inter', sans-serif;
-        }}
-        .uala-hero {{
-            border: 1px solid {theme["accent"]}66;
-            background: {theme["card"]};
-            border-radius: 22px;
-            padding: 1.1rem 1.2rem;
-            margin-bottom: 1rem;
-            backdrop-filter: blur(10px);
-            box-shadow: 0 0 0 1px {theme["accent"]}22 inset, 0 22px 70px rgba(0, 0, 0, 0.24);
-        }}
-        .uala-kicker {{
-            font-size: 0.72rem;
-            letter-spacing: .12em;
-            text-transform: uppercase;
-            color: {theme["accent"]};
-            margin-bottom: .45rem;
-            font-family: 'Roboto Mono', monospace;
-        }}
-        .uala-title {{
-            font-size: 2rem;
-            line-height: 1.05;
-            color: {theme["text"]};
-            margin-bottom: .35rem;
-        }}
-        .uala-sub {{
-            color: {theme["muted"]};
-            font-size: .95rem;
-        }}
-        [data-testid="stSidebar"] {{
-            border-right: 1px solid {theme["accent"]}33;
-            background: color-mix(in srgb, {theme["bg"]} 78%, #06101d 22%);
-            backdrop-filter: blur(12px);
-        }}
-        [data-testid="stChatMessage"] {{
-            max-width: 980px;
-            margin-left: auto;
-            margin-right: auto;
-            border: 1px solid {theme["accent"]}22;
-            border-radius: 20px;
-            background: color-mix(in srgb, {theme["card"]} 88%, transparent 12%);
-            backdrop-filter: blur(10px);
-            box-shadow: 0 12px 40px rgba(0, 0, 0, 0.18);
-        }}
-        .stChatInputContainer {{
-            max-width: 980px;
-            margin-left: auto;
-            margin-right: auto;
-        }}
-        div[data-testid="metric-container"] {{
-            background: color-mix(in srgb, {theme["card"]} 86%, transparent 14%);
-            border: 1px solid {theme["accent"]}33;
-            border-radius: 18px;
-            padding: 0.95rem 1rem;
-            box-shadow: 0 0 0 1px rgba(255,255,255,0.03) inset, 0 16px 44px rgba(0,0,0,0.18);
-            backdrop-filter: blur(10px);
-        }}
-        div[data-testid="metric-container"] label {{
-            color: {theme["muted"]};
-            font-family: 'Roboto Mono', monospace;
-            letter-spacing: .03em;
-        }}
-        div[data-testid="metric-container"] [data-testid="stMetricValue"] {{
-            color: {theme["text"]};
-            text-shadow: 0 0 18px {theme["accent"]}22;
-        }}
-        .stTabs [data-baseweb="tab-list"] {{
-            gap: .45rem;
-        }}
-        .stTabs [data-baseweb="tab"] {{
-            border-radius: 999px;
-            border: 1px solid {theme["accent"]}33;
-            background: color-mix(in srgb, {theme["card"]} 82%, transparent 18%);
-        }}
-        .stButton > button, .stDownloadButton > button {{
-            border-radius: 14px;
-            border: 1px solid {theme["accent"]}55;
-            background: linear-gradient(135deg, {theme["card"]}, color-mix(in srgb, {theme["card"]} 78%, {accent_alt} 22%));
-            color: {theme["text"]};
-            box-shadow: 0 0 0 1px {theme["accent"]}18 inset;
-        }}
-        </style>
-        """,
-        unsafe_allow_html=True,
+    debug_log(
+        f"refresh_assets:end assets={len(st.session_state.get('assets', []))} "
+        f"seconds={st.session_state.get('last_load_seconds', 0.0)}"
     )
+
+
+def apply_theme() -> None:
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500&display=swap');
+    :root {
+        --uala-bg: #f5f5f4;
+        --uala-surface: #ffffff;
+        --uala-surface-soft: #fafaf9;
+        --uala-border: #e7e5e4;
+        --uala-border-strong: #d6d3d1;
+        --uala-text: #111827;
+        --uala-text-muted: #6b7280;
+        --uala-text-soft: #9ca3af;
+        --uala-accent: #1f2937;
+        --uala-accent-soft: #475569;
+        --uala-success: #0f766e;
+        --uala-warning: #a16207;
+        --uala-danger: #991b1b;
+    }
+    [data-testid="stSidebar"] { display: none !important; }
+    [data-testid="collapsedControl"] { display: none !important; }
+    .stApp > header { display: none !important; }
+    .stApp {
+        background: var(--uala-bg);
+        color: var(--uala-text);
+        font-family: 'Inter', var(--font-sans);
+    }
+    [data-testid="stAppViewContainer"] {
+        background: var(--uala-bg);
+    }
+    [data-testid="stAppViewContainer"] * {
+        color: inherit;
+    }
+    .uala-topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        background: var(--uala-surface);
+        border: 1px solid var(--uala-border);
+        border-radius: 14px;
+        padding: 0 20px;
+        min-height: 56px;
+        margin-bottom: 12px;
+        gap: 12px;
+        box-shadow: 0 1px 2px rgba(17, 24, 39, 0.04);
+    }
+    .uala-brand { display: flex; align-items: center; gap: 10px; }
+    .uala-brand-icon {
+        width: 32px; height: 32px; border-radius: 10px;
+        background: var(--uala-accent);
+        display: flex; align-items: center; justify-content: center;
+        font-size: 13px; font-weight: 500; color: white;
+    }
+    .uala-brand-name { font-size: 14px; font-weight: 600; color: var(--uala-text); }
+    .uala-brand-sub { font-size: 11px; color: var(--uala-text-muted); }
+    .uala-nav { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .uala-topbar-right { display: flex; align-items: center; gap: 8px; }
+    .uala-sync-badge {
+        font-size: 10px; color: var(--uala-text-muted);
+        background: var(--uala-surface-soft);
+        border: 1px solid var(--uala-border);
+        border-radius: 999px; padding: 5px 10px;
+        display: flex; align-items: center; gap: 5px;
+    }
+    .uala-sync-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--uala-success); }
+    .uala-sync-dot.warn { background: var(--uala-warning); }
+    .uala-alert-pill {
+        font-size: 10px; padding: 5px 10px; border-radius: 999px;
+        background: #fef2f2; border: 1px solid #fecaca; color: var(--uala-danger);
+        display: flex; align-items: center; gap: 4px;
+    }
+    .uala-alert-pill.ok { background: #f5f5f4; border-color: var(--uala-border); color: var(--uala-text-muted); }
+    .uala-filterbar {
+        display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+        background: var(--uala-surface);
+        border: 1px solid var(--uala-border);
+        border-radius: 14px; padding: 8px 20px;
+        margin-bottom: 12px;
+        box-shadow: 0 1px 2px rgba(17, 24, 39, 0.04);
+    }
+    .uala-hero {
+        background: var(--uala-surface);
+        border: 1px solid var(--uala-border);
+        border-radius: 16px;
+        padding: 1.15rem 1.35rem;
+        margin-bottom: 1rem;
+        box-shadow: 0 1px 2px rgba(17, 24, 39, 0.04);
+    }
+    .uala-kicker { font-size: 0.72rem; letter-spacing: .12em; text-transform: uppercase; color: var(--uala-text-muted); margin-bottom: .45rem; }
+    .uala-title { font-size: 2rem; line-height: 1.05; color: var(--uala-text); margin-bottom: .35rem; font-weight: 600; }
+    .uala-sub { color: var(--uala-text-muted); font-size: .95rem; }
+    div[data-testid="metric-container"] {
+        background: var(--uala-surface) !important;
+        border: 1px solid var(--uala-border) !important;
+        border-radius: 14px !important;
+        padding: 12px 16px !important;
+        box-shadow: none !important;
+    }
+    div[data-testid="metric-container"] label {
+        font-size: 11px !important;
+        color: var(--uala-text-muted) !important;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+    }
+    div[data-testid="metric-container"] [data-testid="stMetricValue"] {
+        font-size: 24px !important;
+        font-weight: 600 !important;
+        color: var(--uala-text) !important;
+        text-shadow: none !important;
+    }
+    [data-testid="stChatMessage"] {
+        background: var(--uala-surface) !important;
+        border: 1px solid var(--uala-border) !important;
+        border-radius: 14px !important;
+        box-shadow: none !important;
+        max-width: 100% !important;
+    }
+    .stTabs [data-baseweb="tab-list"] { gap: 6px; border-bottom: 1px solid var(--uala-border); }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 10px 10px 0 0 !important;
+        border: 1px solid transparent !important;
+        background: transparent !important;
+        color: var(--uala-text-muted) !important;
+        font-size: 13px;
+        padding: 8px 16px;
+    }
+    .stTabs [aria-selected="true"] {
+        background: var(--uala-surface) !important;
+        border-color: var(--uala-border) !important;
+        border-bottom-color: var(--uala-surface) !important;
+        color: var(--uala-text) !important;
+        font-weight: 600 !important;
+    }
+    .stButton > button {
+        border-radius: 12px !important;
+        border: 1px solid var(--uala-border-strong) !important;
+        background: var(--uala-surface) !important;
+        color: var(--uala-text) !important;
+        font-size: 13px !important;
+        font-weight: 500 !important;
+        box-shadow: none !important;
+        padding: 8px 16px !important;
+    }
+    .stButton > button:hover {
+        background: var(--uala-surface-soft) !important;
+        border-color: var(--uala-accent-soft) !important;
+    }
+    .stButton > button[kind="primary"] {
+        background: var(--uala-accent) !important;
+        color: white !important;
+        border-color: var(--uala-accent) !important;
+    }
+    .stButton > button p { color: inherit !important; }
+    .stTextInput > div > div > input,
+    .stTextArea textarea,
+    [data-testid="stChatInput"] textarea,
+    [data-baseweb="input"] input,
+    [data-testid="stDateInput"] input {
+        background: var(--uala-surface) !important;
+        color: var(--uala-text) !important;
+        border-radius: 12px !important;
+    }
+    .stTextInput > div > div,
+    .stTextArea > div > div,
+    [data-baseweb="input"] > div,
+    [data-testid="stDateInput"] > div > div,
+    div[data-baseweb="select"] > div {
+        background: var(--uala-surface) !important;
+        border: 1px solid var(--uala-border-strong) !important;
+        border-radius: 12px !important;
+        box-shadow: none !important;
+        color: var(--uala-text) !important;
+    }
+    div[data-baseweb="select"] * {
+        color: var(--uala-text) !important;
+    }
+    .stMultiSelect [data-baseweb="tag"] {
+        background: var(--uala-surface-soft) !important;
+        border: 1px solid var(--uala-border) !important;
+        color: var(--uala-text) !important;
+        border-radius: 999px !important;
+    }
+    input::placeholder, textarea::placeholder {
+        color: var(--uala-text-soft) !important;
+        opacity: 1 !important;
+    }
+    .uala-confirm-bar {
+        background: #fffbeb;
+        border: 1px solid #fcd34d;
+        border-radius: 12px;
+        padding: 10px 16px;
+        display: flex; align-items: center; justify-content: space-between;
+        margin: 8px 0;
+    }
+    .uala-confirm-text { font-size: 13px; color: #92400e; }
+    [data-testid="stDataFrame"] {
+        border: 1px solid var(--uala-border) !important;
+        border-radius: 14px !important;
+        overflow: hidden;
+        background: var(--uala-surface) !important;
+    }
+    .stAlert {
+        border-radius: 12px !important;
+        border: 1px solid var(--uala-border) !important;
+    }
+    #MainMenu { visibility: hidden; }
+    footer { visibility: hidden; }
+    </style>
+    """, unsafe_allow_html=True)
 
 
 # ── 10. UI STREAMLIT (páginas, sidebar, branding) ─────────────────────────
 def render_branding(config: AppConfig) -> None:
+    workspace_label = escape_html_text(config.workspace_id or "no configurado")
     st.markdown(
         f"""
         <div class="uala-hero">
             <div class="uala-kicker">Uala Asset Control</div>
             <div class="uala-title">Inventario Uala (Jira Assets)</div>
-            <div class="uala-sub">Workspace: {config.workspace_id or 'no configurado'} · Esquema: {SCHEMA_ID}</div>
+            <div class="uala-sub">Workspace: {workspace_label} · Esquema: {SCHEMA_ID}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -4052,7 +4562,7 @@ def render_branding(config: AppConfig) -> None:
 
 def render_setup_screen() -> None:
     st.title("Configuración inicial")
-    st.warning("No se encontraron credenciales. Configurá las variables de entorno.")
+    st.warning("Faltan variables obligatorias. Configurá el entorno antes de usar la app.")
     with st.expander("Variables necesarias"):
         st.code(
             "JIRA_EMAIL=tu-email@bancar.com\n"
@@ -4065,31 +4575,128 @@ def render_setup_screen() -> None:
     st.info("En local: crear archivo .env con esas variables.")
 
 
+def render_topbar(config: AppConfig, current_page: str, assets: list[dict[str, Any]]) -> str:
+    pages = ["Chat", "Activos", "Insights", "Auditoría", "Movimientos", "Scripts", "Extra"]
+    last_sync = st.session_state.get("last_sync")
+    sync_text = last_sync.strftime("%H:%M:%S") if last_sync else "sin sync"
+    anomaly = st.session_state.get("anomaly_report", {})
+    total_anomaly = int(anomaly.get("total", 0))
+    garantia_vencida = int(anomaly.get("garantia_vencida_en_uso", 0))
+    alert_class = "ok" if total_anomaly == 0 else ""
+    alert_text = "Sin anomalías" if total_anomaly == 0 else f"{total_anomaly} anomalías"
+    workspace_label = escape_html_text(config.workspace_id[:8] if config.workspace_id else "no conf.")
+    alert_label = escape_html_text(alert_text)
+    garantia_label = escape_html_text(f" · {garantia_vencida} garantías" if total_anomaly else "")
+
+    st.markdown(
+        f"""
+        <div class="uala-topbar">
+            <div class="uala-brand">
+                <div class="uala-brand-icon">U</div>
+                <div>
+                    <div class="uala-brand-name">Uala Asset Control</div>
+                    <div class="uala-brand-sub">Workspace {workspace_label} · Esquema {SCHEMA_ID}</div>
+                </div>
+            </div>
+            <div class="uala-topbar-right">
+                <div class="uala-alert-pill {alert_class}">{alert_label}{garantia_label}</div>
+                <div class="uala-sync-badge"><div class="uala-sync-dot {'' if last_sync else 'warn'}"></div>{sync_text}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    nav_cols = st.columns(len(pages))
+    for idx, page in enumerate(pages):
+        label = f"• {page}" if page == current_page else page
+        if nav_cols[idx].button(label, key=f"top_nav_{page}", use_container_width=True):
+            st.query_params["page"] = page
+            st.rerun()
+    return current_page
+
+
+def render_filterbar(config: AppConfig) -> None:
+    assets_raw = st.session_state.get("assets", [])
+    countries = sorted({str(a.get("country") or "Sin país") for a in assets_raw if a.get("country") and a.get("country") != "Sin país"})
+    companies = sorted({str(a.get("company") or "") for a in assets_raw if a.get("company")})
+    persisted_countries = normalize_type_id_list([])
+    persisted_countries = [value for value in (st.session_state.get("global_filter_countries", []) or []) if value in countries]
+    persisted_companies = [value for value in (st.session_state.get("global_filter_companies", []) or []) if value in companies]
+    if persisted_countries != list(st.session_state.get("global_filter_countries", []) or []):
+        st.session_state.global_filter_countries = persisted_countries
+    if persisted_companies != list(st.session_state.get("global_filter_companies", []) or []):
+        st.session_state.global_filter_companies = persisted_companies
+    st.markdown('<div class="uala-filterbar"></div>', unsafe_allow_html=True)
+    col_filters, col_companies, col_aql, col_actions = st.columns([3, 3, 2, 1])
+    with col_filters:
+        selected_countries = st.multiselect(
+            "País",
+            options=countries,
+            default=persisted_countries,
+            label_visibility="collapsed",
+            placeholder="Filtrar por país...",
+        )
+        st.session_state.global_filter_countries = selected_countries
+    with col_companies:
+        selected_companies = st.multiselect(
+            "Compañía",
+            options=companies,
+            default=persisted_companies,
+            label_visibility="collapsed",
+            placeholder="Filtrar por compañía...",
+        )
+        st.session_state.global_filter_companies = selected_companies
+    with col_aql:
+        aql_val = st.text_input(
+            "AQL",
+            value=st.session_state.get("aql_input", ""),
+            placeholder="AQL adicional...",
+            label_visibility="collapsed",
+        )
+        st.session_state.aql_input = aql_val.strip()
+    with col_actions:
+        col_ref, col_clr = st.columns(2)
+        if col_ref.button("↻", help="Refrescar inventario", use_container_width=True):
+            st.session_state.cache_hash = ""
+            st.session_state.cache_expiry = None
+            refresh_assets(config, st.session_state.aql_input, force_live=True)
+            st.rerun()
+        if col_clr.button("✕", help="Limpiar filtros", use_container_width=True):
+            st.session_state.global_filter_countries = []
+            st.session_state.global_filter_companies = []
+            st.session_state.aql_input = ""
+            st.rerun()
+    raw_count = len(assets_raw)
+    filtered_count = len(apply_global_filter(assets_raw))
+    if raw_count != filtered_count:
+        st.caption(f"Mostrando {filtered_count} de {raw_count} activos · filtro activo")
+    st.divider()
+
+
 def render_insights(assets: list[dict[str, Any]]) -> None:
     st.subheader("Insights")
     nl_prompt = st.text_input(
-        "Construir dashboard por lenguaje natural",
+        "Filtrar dashboard por lenguaje natural",
         value=st.session_state.get("insights_prompt", ""),
-        placeholder="Ej: dashboard de gasto por país y calidad de datos para Bancar ARG",
+        placeholder="Ej: activos de Bancar ARG con garantía por vencer",
     )
     st.session_state.insights_prompt = nl_prompt
     dashboard_spec = parse_nl_dashboard_request(nl_prompt) if nl_prompt else {}
-    working_assets = apply_filters(assets, dashboard_spec.get("filters", {})) if dashboard_spec else assets
+    working = apply_filters(assets, dashboard_spec.get("filters", {})) if dashboard_spec else assets
+    total = len(working)
+    if total == 0:
+        st.warning("No hay activos para los filtros actuales.")
+        return
 
-    total = len(working_assets)
-    in_use = sum(1 for a in working_assets if normalize_text(a.get("status")) == normalize_text("En uso"))
-    stock = sum(1 for a in working_assets if normalize_text(a.get("status")) in {normalize_text("Stock nuevo"), normalize_text("Stock usado")})
-    stock_nuevo = sum(1 for a in working_assets if normalize_text(a.get("status")) == normalize_text("Stock nuevo"))
-    stock_usado = sum(1 for a in working_assets if normalize_text(a.get("status")) == normalize_text("Stock usado"))
-    sin_asignar = sum(1 for a in working_assets if not str(a.get("assigned_to") or "").strip())
-    sin_serial = sum(1 for a in working_assets if not str(get_serial_value(a)).strip())
-    sin_hostname = sum(1 for a in working_assets if not str(get_hostname_value(a)).strip())
-    sin_costo = sum(1 for a in working_assets if parse_cost(str(a.get("purchase_price", ""))) <= 0)
-    sin_garantia = sum(1 for a in working_assets if not str(a.get("warranty_date") or "").strip())
-    today = datetime.now().date()
+    in_use = sum(1 for a in working if normalize_text(a.get("status", "")) == "en uso")
+    stock_nuevo = sum(1 for a in working if normalize_text(a.get("status", "")) == "stock nuevo")
+    stock_usado = sum(1 for a in working if normalize_text(a.get("status", "")) == "stock usado")
+    sin_asignar = sum(1 for a in working if not str(a.get("assigned_to") or "").strip())
+    sin_serial = sum(1 for a in working if not str(get_serial_value(a)).strip())
     garantia_vencida = 0
     garantia_45 = 0
-    for a in working_assets:
+    today = datetime.now().date()
+    for a in working:
         w = parse_date(str(a.get("warranty_date", "")).split("|")[0].strip())
         if not w:
             continue
@@ -4098,130 +4705,295 @@ def render_insights(assets: list[dict[str, Any]]) -> None:
             garantia_vencida += 1
         elif delta <= 45:
             garantia_45 += 1
-    dep = calculate_depreciation(working_assets)
-    costo_total = round(sum(parse_cost(str(a.get("purchase_price", ""))) for a in working_assets), 2)
-    costo_prom = round(costo_total / max(total, 1), 2)
-    model_counter = Counter((a.get("model") or "Sin modelo") for a in working_assets)
-    provider_counter = Counter((a.get("provider") or "Sin proveedor") for a in working_assets)
-    by_category = Counter((a.get("category") or "Sin categoría") for a in working_assets)
-    coverage_counter: dict[str, int] = {}
-    for a in working_assets:
-        for k, v in (a.get("attrs_by_name") or {}).items():
-            if str(v or "").strip():
-                coverage_counter[k] = coverage_counter.get(k, 0) + 1
+    costo_total = round(sum(parse_cost(str(a.get("purchase_price", ""))) for a in working), 2)
+    dep = calculate_depreciation(working)
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total activos", total)
-    c2.metric("En uso", in_use)
-    c3.metric("Disponibles (stock)", stock)
-    c4, c5, c6, c7, c8 = st.columns(5)
-    c4.metric("Stock nuevo", stock_nuevo)
-    c5.metric("Stock usado", stock_usado)
-    c6.metric("Sin asignar", sin_asignar)
-    c7.metric("Sin serial", sin_serial)
-    c8.metric("Sin hostname", sin_hostname)
-    c9, c10, c11, c12 = st.columns(4)
-    c9.metric("Sin costo", sin_costo)
-    c10.metric("Sin garantía", sin_garantia)
-    c11.metric("Garantía vencida", garantia_vencida)
-    c12.metric("Garantía <=45 días", garantia_45)
-    c13, c14, c15 = st.columns(3)
-    c13.metric("Costo total inventario", f"{costo_total}")
-    c14.metric("Costo promedio", f"{costo_prom}")
-    c15.metric("Valor contable actual", f"{dep.get('total_book_value', 0)}")
+    r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+    r1c1.metric("Total activos", total)
+    r1c2.metric("En uso", in_use, delta=f"{round(in_use / max(total, 1) * 100, 1)}%")
+    r1c3.metric("Stock nuevo", stock_nuevo)
+    r1c4.metric("Stock usado", stock_usado)
 
+    r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+    r2c1.metric("Sin asignar", sin_asignar, delta="revisar" if sin_asignar > 0 else "ok", delta_color="inverse" if sin_asignar > 0 else "normal")
+    r2c2.metric("Sin serial", sin_serial, delta=f"{round(sin_serial / max(total, 1) * 100, 1)}%", delta_color="inverse" if sin_serial > 0 else "normal")
+    r2c3.metric("Garantía vencida", garantia_vencida, delta="urgente" if garantia_vencida > 0 else "ok", delta_color="inverse" if garantia_vencida > 0 else "normal")
+    r2c4.metric("Garantía ≤45 días", garantia_45, delta="atención" if garantia_45 > 0 else "ok", delta_color="inverse" if garantia_45 > 0 else "normal")
+
+    st.divider()
     if pd is None or px is None:
-        st.info("Para Insights visuales instalá `pandas` y `plotly`.")
+        st.info("Instalá `pandas` y `plotly` para gráficos.")
         return
 
-    spend_by_entity: dict[str, float] = {}
-    by_country: dict[str, int] = {}
-    attr_presence = {"Serial": 0, "Hostname": 0, "Estado": 0, "Asignado": 0, "País": 0}
-    periph_counts: dict[str, int] = {}
-    critical_threshold = int(st.session_state.get("critical_threshold", 10))
-    peripheral_keywords = {"mouse", "teclado", "keyboard", "headset", "adaptador", "adapter", "dock"}
+    tab_geo, tab_estado, tab_quality, tab_financiero, tab_stock = st.tabs(["Geografía", "Estados", "Calidad de datos", "Financiero", "Stock crítico"])
+    with tab_geo:
+        geo_rows = [{"País": a.get("country") or "Sin país", "Compañía": a.get("company") or "Sin compañía"} for a in working]
+        df_geo = pd.DataFrame(geo_rows)
+        geo_count = df_geo.groupby(["País", "Compañía"]).size().reset_index(name="Cantidad")
+        fig = px.bar(geo_count, x="País", y="Cantidad", color="Compañía", barmode="group", title="Activos por País y Compañía", text_auto=True, color_discrete_sequence=["#111827", "#334155", "#475569", "#64748b", "#94a3b8"])
+        fig.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(size=12), margin=dict(t=40, b=30, l=0, r=0), legend=dict(orientation="h", yanchor="bottom", y=1.02), xaxis=dict(gridcolor="rgba(0,0,0,0.06)"), yaxis=dict(gridcolor="rgba(0,0,0,0.06)"))
+        st.plotly_chart(fig, use_container_width=True)
 
-    for a in working_assets:
-        entity = str(a.get("entity") or "Sin entidad")
-        spend_by_entity[entity] = spend_by_entity.get(entity, 0.0) + parse_cost(str(a.get("purchase_price", "")))
-        country = str(a.get("country") or "Sin país")
-        by_country[country] = by_country.get(country, 0) + 1
-        if str(get_serial_value(a)).strip():
-            attr_presence["Serial"] += 1
-        if str(get_hostname_value(a)).strip():
-            attr_presence["Hostname"] += 1
-        if str(a.get("status", "")).strip():
-            attr_presence["Estado"] += 1
-        if str(a.get("assigned_to", "")).strip():
-            attr_presence["Asignado"] += 1
-        if str(a.get("country", "")).strip():
-            attr_presence["País"] += 1
+    with tab_estado:
+        rows_es = [{"Categoría": a.get("category") or "Sin cat", "Estado": a.get("status") or "Sin estado"} for a in working]
+        df_es = pd.DataFrame(rows_es)
+        count_es = df_es.groupby(["Categoría", "Estado"]).size().reset_index(name="Cantidad")
+        color_map = {"En uso": "#0f766e", "Stock nuevo": "#334155", "Stock usado": "#78716c", "Asignado al edificio": "#64748b", "Sin estado": "#cbd5e1"}
+        fig2 = px.bar(count_es, x="Categoría", y="Cantidad", color="Estado", barmode="stack", title="Estado por Categoría", color_discrete_map=color_map, text_auto=True)
+        fig2.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", margin=dict(t=40, b=30, l=0, r=0), xaxis=dict(gridcolor="rgba(0,0,0,0.06)"), yaxis=dict(gridcolor="rgba(0,0,0,0.06)"))
+        st.plotly_chart(fig2, use_container_width=True)
 
-        cat = normalize_text(a.get("category"))
-        name_blob = normalize_text(" ".join([str(a.get("name", "")), str(a.get("model", "")), cat]))
-        if "consumible" in cat or any(k in name_blob for k in peripheral_keywords):
-            key = a.get("category") or "Periférico"
-            if normalize_text(a.get("status")) in {normalize_text("Stock nuevo"), normalize_text("Stock usado")}:
-                periph_counts[key] = periph_counts.get(key, 0) + 1
-
-    show_spend = dashboard_spec.get("show_spend", False) or not dashboard_spec
-    show_geo = dashboard_spec.get("show_geo", False) or not dashboard_spec
-    show_quality = dashboard_spec.get("show_quality", False) or not dashboard_spec
-    show_stock = dashboard_spec.get("show_stock", False) or not dashboard_spec
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        if show_spend:
-            st.markdown("**Gasto Total por Entidad**")
-            df_spend = pd.DataFrame([{"Entidad": k, "Gasto": round(v, 2)} for k, v in spend_by_entity.items()])
-            if not df_spend.empty:
-                fig1 = px.bar(df_spend.sort_values("Gasto", ascending=False), x="Entidad", y="Gasto")
-                st.plotly_chart(fig1, use_container_width=True)
-    with col_b:
-        if show_geo:
-            st.markdown("**Distribución Geográfica (Stock por País)**")
-            df_country = pd.DataFrame([{"País": k, "Cantidad": v} for k, v in by_country.items()])
-            if not df_country.empty:
-                fig2 = px.pie(df_country, names="País", values="Cantidad")
-                st.plotly_chart(fig2, use_container_width=True)
-
-    if show_stock:
-        st.markdown("**Stock Crítico (Semáforo de Periféricos)**")
-        sem_rows = []
-        for cat, qty in sorted(periph_counts.items(), key=lambda x: x[0]):
-            sem = "Verde"
-            if qty <= 0:
-                sem = "Rojo"
-            elif qty <= critical_threshold:
-                sem = "Amarillo"
-            sem_rows.append({"Categoría": cat, "Disponibles": qty, "Semáforo": sem})
-        st.dataframe(sem_rows, use_container_width=True, hide_index=True)
-
-    if show_quality:
-        st.markdown("**Data Quality (Cobertura de atributos clave)**")
-        df_quality = pd.DataFrame(
-            [{"Atributo": k, "Cobertura %": round((v / max(total, 1)) * 100, 2)} for k, v in attr_presence.items()]
-        )
-        fig3 = px.bar(df_quality, x="Atributo", y="Cobertura %")
+    with tab_quality:
+        quality_scores = {
+            "Serial": sum(1 for a in working if get_serial_value(a)),
+            "Hostname": sum(1 for a in working if get_hostname_value(a)),
+            "Modelo": sum(1 for a in working if a.get("model")),
+            "Estado válido": sum(1 for a in working if normalize_text(a.get("status", "")) in {normalize_text(v) for v in ESTADO_NORMALIZATION.values()}),
+            "Costo cargado": sum(1 for a in working if parse_cost(str(a.get("purchase_price", "")))),
+            "País asignado": sum(1 for a in working if a.get("country") and a.get("country") != "Sin país"),
+            "Garantía cargada": sum(1 for a in working if a.get("warranty_date")),
+            "Asignado/Stock ok": sum(1 for a in working if a.get("assigned_to") or "stock" in normalize_text(a.get("status", ""))),
+        }
+        df_q = pd.DataFrame([{"Campo": k, "Cobertura": round(v / max(total, 1) * 100, 1), "Faltantes": total - v} for k, v in quality_scores.items()]).sort_values("Cobertura")
+        fig3 = px.bar(df_q, x="Cobertura", y="Campo", orientation="h", title="Cobertura de atributos clave (%)", text="Cobertura", color="Cobertura", color_continuous_scale=["#e7e5e4", "#94a3b8", "#0f766e"], range_color=[0, 100], custom_data=["Faltantes"])
+        fig3.update_traces(texttemplate="%{text:.1f}%", textposition="outside", hovertemplate="<b>%{y}</b><br>Cobertura: %{x:.1f}%<br>Faltantes: %{customdata[0]}<extra></extra>")
+        fig3.update_layout(xaxis=dict(range=[0, 115], gridcolor="rgba(0,0,0,0.06)"), yaxis=dict(gridcolor="rgba(0,0,0,0)"), coloraxis_showscale=False, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", margin=dict(t=40, b=20, l=0, r=60))
         st.plotly_chart(fig3, use_container_width=True)
-        if coverage_counter:
-            dyn_quality = pd.DataFrame(
-                [{"Atributo dinámico": k, "Cobertura %": round((v / max(total, 1)) * 100, 2)} for k, v in coverage_counter.items()]
-            ).sort_values("Cobertura %", ascending=False)
-            st.dataframe(dyn_quality, use_container_width=True, hide_index=True)
+        worst = df_q[df_q["Cobertura"] < 80].sort_values("Cobertura")
+        if not worst.empty:
+            st.caption(f"Campos con cobertura menor al 80% — {len(worst)} campos")
+            st.dataframe(worst[["Campo", "Cobertura", "Faltantes"]], use_container_width=True, hide_index=True)
 
-    st.markdown("**Top 3 modelos y proveedores**")
-    col_top1, col_top2, col_top3 = st.columns(3)
-    col_top1.write("\n".join([f"- {m}: {c}" for m, c in model_counter.most_common(3)]) or "Sin datos")
-    col_top2.write("\n".join([f"- {p}: {c}" for p, c in provider_counter.most_common(3)]) or "Sin datos")
-    col_top3.write("\n".join([f"- {c}: {n}" for c, n in by_category.most_common(3)]) or "Sin datos")
+    with tab_financiero:
+        costo_por_pais: dict[str, float] = {}
+        costo_por_cat: dict[str, float] = {}
+        for a in working:
+            amount = parse_cost(str(a.get("purchase_price", "")))
+            if amount <= 0:
+                continue
+            pais = a.get("country") or "Sin país"
+            cat = a.get("category") or "Sin categoría"
+            costo_por_pais[pais] = costo_por_pais.get(pais, 0) + amount
+            costo_por_cat[cat] = costo_por_cat.get(cat, 0) + amount
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
+            if costo_por_pais:
+                df_fp = pd.DataFrame([{"País": k, "Costo": round(v, 2)} for k, v in costo_por_pais.items()]).sort_values("Costo", ascending=False)
+                fig_fp = px.bar(df_fp, x="País", y="Costo", title="Inversión por País", text_auto=".2s", color="Costo", color_continuous_scale=["#e7e5e4", "#334155"])
+                fig_fp.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", coloraxis_showscale=False, margin=dict(t=40, b=20))
+                st.plotly_chart(fig_fp, use_container_width=True)
+        with col_f2:
+            if costo_por_cat:
+                df_fc = pd.DataFrame([{"Categoría": k, "Costo": round(v, 2)} for k, v in costo_por_cat.items()]).sort_values("Costo", ascending=False)
+                fig_fc = px.pie(df_fc, names="Categoría", values="Costo", title="Inversión por Categoría", color_discrete_sequence=["#111827", "#334155", "#475569", "#64748b", "#94a3b8", "#cbd5e1"])
+                fig_fc.update_traces(textinfo="label+percent")
+                fig_fc.update_layout(paper_bgcolor="rgba(0,0,0,0)", margin=dict(t=40, b=20))
+                st.plotly_chart(fig_fc, use_container_width=True)
+        f1, f2, f3 = st.columns(3)
+        f1.metric("Costo total inventario", f"${costo_total:,.0f}")
+        con_precio = [a for a in working if parse_cost(str(a.get("purchase_price", ""))) > 0]
+        avg = round(costo_total / max(len(con_precio), 1), 2)
+        f2.metric("Costo promedio", f"${avg:,.0f}")
+        f3.metric("Valor contable actual", f"${dep.get('total_book_value', 0):,.0f}", delta=f"-${round(costo_total - dep.get('total_book_value', 0), 0):,.0f} depreciado")
 
-    with st.expander("Prueba NL (100 preguntas)", expanded=False):
-        if st.button("Ejecutar prueba de cobertura NL", use_container_width=True):
-            report = run_nl_coverage_test(working_assets)
-            st.write(f"Resultado: **{report['ok']} / {report['total']}**")
-            if report["failures"]:
-                st.write(report["failures"])
+    with tab_stock:
+        st.markdown("**Stock disponible por categoría**")
+        critical_threshold = int(st.session_state.get("critical_threshold", 10))
+        cat_stock: dict[str, int] = {}
+        for a in working:
+            if normalize_text(a.get("status", "")) not in {normalize_text("stock nuevo"), normalize_text("stock usado")}:
+                continue
+            cat = a.get("category") or "Sin categoría"
+            cat_stock[cat] = cat_stock.get(cat, 0) + 1
+        if not cat_stock:
+            st.info("No hay stock disponible para los filtros actuales.")
+        else:
+            for cat, qty in sorted(cat_stock.items(), key=lambda x: x[1]):
+                if qty == 0:
+                    color, label = "#991b1b", "CRÍTICO"
+                elif qty <= critical_threshold:
+                    color, label = "#a16207", "BAJO"
+                else:
+                    color, label = "#0f766e", "OK"
+                c1, c2, c3 = st.columns([3, 1, 1])
+                c1.write(cat)
+                c2.markdown(f"<span style='color:{color};font-weight:500;font-size:12px;'>{label}</span>", unsafe_allow_html=True)
+                c3.write(str(qty))
+
+
+def colored_metric(container: Any, label: str, value: Any, alert_threshold: int | float | None = None, inverse: bool = False) -> None:
+    if alert_threshold is None:
+        container.metric(label, value)
+        return
+    numeric_val = value if isinstance(value, (int, float)) else 0
+    if inverse:
+        delta_color = "inverse" if numeric_val > alert_threshold else "normal"
+        delta = "⚠️ revisar" if numeric_val > alert_threshold else "✅ ok"
+    else:
+        delta_color = "normal" if numeric_val >= alert_threshold else "inverse"
+        delta = "✅ ok" if numeric_val >= alert_threshold else "⚠️ bajo"
+    container.metric(label, value, delta=delta, delta_color=delta_color)
+
+
+def build_contextual_suggestions(assets: list[dict[str, Any]], anomaly: dict[str, Any]) -> list[str]:
+    suggestions = ["Resumen ejecutivo del inventario"]
+    if anomaly.get("en_uso_sin_asignado", 0) > 0:
+        suggestions.append(f"Mostrame los {anomaly['en_uso_sin_asignado']} equipos en uso sin usuario asignado")
+    if anomaly.get("serial_duplicado", 0) > 0:
+        suggestions.append(f"Hay {anomaly['serial_duplicado']} seriales duplicados — mostrálos")
+    if anomaly.get("garantia_vencida_en_uso", 0) > 0:
+        suggestions.append(f"Equipos en uso con garantía vencida ({anomaly['garantia_vencida_en_uso']})")
+    sin_serial = sum(1 for a in assets if not get_serial_value(a))
+    if sin_serial > 0:
+        suggestions.append(f"Mostrame los {sin_serial} activos sin número de serie")
+    countries = sorted({a.get("country") for a in assets if a.get("country") and a.get("country") != "Sin país"})
+    for country in countries[:2]:
+        suggestions.append(f"Stock disponible en {country}")
+    con_costo = sum(1 for a in assets if parse_cost(str(a.get("purchase_price", ""))) > 0)
+    if con_costo > 10:
+        suggestions.append("¿Cuál es el costo total del inventario por país?")
+    seen: set[str] = set()
+    unique: list[str] = []
+    for item in suggestions:
+        if item not in seen:
+            seen.add(item)
+            unique.append(item)
+    return unique[:6]
+
+
+def _build_contextual_suggestions(assets: list[dict[str, Any]], anomaly: dict[str, Any]) -> list[str]:
+    return build_contextual_suggestions(assets, anomaly)
+
+
+def _execute_pending_action(config: AppConfig, assets: list[dict[str, Any]], pending_action: dict[str, Any] | None = None) -> tuple[bool, str]:
+    pending_action = pending_action or st.session_state.get("pending_action")
+    if not pending_action:
+        return False, "No hay acción pendiente."
+
+    action = pending_action.get("action")
+    ok = False
+    answer = "Acción no válida."
+    if action == "assign":
+        ok, answer = assign_asset(config, assets, pending_action["identifier"], pending_action["assignee"])
+    elif action == "unassign":
+        ok, answer = unassign_asset(config, assets, pending_action["identifier"], pending_action.get("target_status", "Stock usado"))
+    elif action == "status":
+        ok, answer = update_status(config, assets, pending_action["identifier"], pending_action["new_status"])
+    elif action == "bulk":
+        updated, errors = bulk_update_location(config, assets, pending_action["identifiers"], pending_action["company"], pending_action["country"])
+        ok = updated > 0
+        answer = f"Bulk update aplicado. Actualizados: {updated}/{len(pending_action['identifiers'])}."
+        if errors:
+            answer += " " + " | ".join(errors[:5])
+    elif action == "regla":
+        regla = pending_action["regla"]
+        rule_obj = ReglaNormalizacion(**regla) if isinstance(regla, dict) else regla
+        updated, errors = aplicar_regla(config, assets, rule_obj, dry_run=False)
+        ok = updated > 0
+        answer = f"Regla aplicada. Afectados: {updated}."
+        if errors:
+            answer += " " + " | ".join(errors[:5])
+
+    st.session_state.pending_action = None
+    return ok, answer
+
+
+def _render_pending_action_block(config: AppConfig, all_assets: list[dict[str, Any]]) -> None:
+    pending = st.session_state.get("pending_action")
+    if not pending:
+        return
+    pending_summary = escape_html_text(pending.get("summary", ""))
+
+    st.markdown(
+        f"""
+        <div class="uala-confirm-bar">
+            <div class="uala-confirm-text">
+                ⚡ <strong>Acción pendiente:</strong> {pending_summary}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    col_ok, col_no, _ = st.columns([1, 1, 4])
+    if col_ok.button("✅ Confirmar", key="btn_confirm_pending", type="primary", use_container_width=True):
+        ok, msg = _execute_pending_action(config, all_assets, pending)
+        st.session_state.pending_action = None
+        if ok:
+            refresh_assets(config, st.session_state.get("aql_input", ""), force_live=True)
+            st.success(f"✅ {msg}")
+        else:
+            st.error(f"❌ {msg}")
+    if col_no.button("✕ Cancelar", key="btn_cancel_pending", use_container_width=True):
+        st.session_state.pending_action = None
+        st.session_state.chat_history.append({"role": "assistant", "content": "Acción cancelada."})
+        st.rerun()
+
+
+def _process_chat_prompt(config: AppConfig, all_assets: list[dict[str, Any]], filtered_assets: list[dict[str, Any]], prompt: str) -> None:
+    st.session_state.chat_history.append({"role": "user", "content": prompt})
+    regla = parse_normalization_rule_from_prompt(prompt)
+    if regla:
+        affected, _ = aplicar_regla(config, all_assets, regla, dry_run=True)
+        sample = [str(a.get("jira_key") or a.get("hostname") or a.get("name", "")) for a in all_assets if evaluar_regla(a, regla)][:5]
+        preview = (
+            f"**Regla detectada**\n\n"
+            f"- Condición: `{regla.campo_condicion}` {regla.operador} `{regla.valor_condicion}`\n"
+            f"- Acción: `{regla.campo_a_modificar}` → `{regla.valor_nuevo}`\n"
+            f"- **Activos afectados: {affected}**\n"
+            f"- Muestra: {', '.join(sample) if sample else 'sin coincidencias'}\n\n"
+            f"_Usá el botón Confirmar para aplicar._"
+        )
+        st.session_state.pending_action = {
+            "action": "regla",
+            "regla": regla.__dict__,
+            "summary": f"'{regla.descripcion}' — {affected} activos afectados",
+        }
+        st.session_state.chat_history.append({"role": "assistant", "content": preview})
+        push_openai_history(prompt, preview)
+        return
+
+    assignment = parse_assignment_action(prompt)
+    if assignment:
+        identifier, assignee = assignment
+        st.session_state.pending_action = {"action": "assign", "identifier": identifier, "assignee": assignee, "summary": f"Asignar `{identifier}` a `{assignee}`"}
+        st.session_state.chat_history.append({"role": "assistant", "content": f"Asignación detectada: `{identifier}` → `{assignee}`. Confirmá con el botón."})
+        return
+    unassign = parse_unassign_action(prompt)
+    if unassign:
+        identifier, target_status = unassign
+        st.session_state.pending_action = {"action": "unassign", "identifier": identifier, "target_status": target_status, "summary": f"Desasignar `{identifier}` → estado `{target_status}`"}
+        st.session_state.chat_history.append({"role": "assistant", "content": f"Desasignación detectada: `{identifier}`. Confirmá con el botón."})
+        return
+    status_change = parse_status_change_action(prompt)
+    if status_change:
+        identifier, new_status = status_change
+        st.session_state.pending_action = {"action": "status", "identifier": identifier, "new_status": new_status, "summary": f"Cambiar estado de `{identifier}` → `{new_status}`"}
+        st.session_state.chat_history.append({"role": "assistant", "content": f"Cambio de estado detectado: `{identifier}` → `{new_status}`. Confirmá con el botón."})
+        return
+    bulk = parse_bulk_location_action(prompt)
+    if bulk:
+        identifiers, company, country = bulk
+        st.session_state.pending_action = {"action": "bulk", "identifiers": identifiers, "company": company, "country": country, "summary": f"Bulk update {len(identifiers)} activos → {country}/{company}"}
+        st.session_state.chat_history.append({"role": "assistant", "content": f"Actualización masiva detectada: {len(identifiers)} activos → {country}/{company}. Confirmá con el botón."})
+        return
+
+    dashboard_req = parse_nl_dashboard_request(prompt)
+    if dashboard_req:
+        response = answer_inventory_question(filtered_assets, prompt)
+    else:
+        suggested_aql, notes = build_aql_from_prompt(prompt)
+        if suggested_aql:
+            try:
+                fetched = fetch_assets(config, suggested_aql)
+                use_ai = st.session_state.get("use_ai_compact", True)
+                answer = ai_compact_answer(config, prompt, fetched, notes, prefiltered=True) if use_ai and config.openai_api_key else answer_inventory_question(fetched, prompt)
+                response = f"_AQL: `{suggested_aql}`_ · {len(fetched)} activos\n\n{answer}"
+            except RuntimeError as exc:
+                response = f"Falló AQL: {exc}\n\n{answer_inventory_question(filtered_assets, prompt)}"
+        else:
+            response = answer_inventory_question(filtered_assets, prompt)
+    st.session_state.chat_history.append({"role": "assistant", "content": response})
+    push_openai_history(prompt, decode_chat_payload(response)[0])
 
 
 # ── 9. EXPORTACIONES (Excel) ──────────────────────────────────────────────
@@ -4243,7 +5015,12 @@ def render_assets_page(assets: list[dict[str, Any]]) -> None:
     filtered = []
     term = normalize_text(search)
     terms = [normalize_text(x) for x in search.split(",") if normalize_text(x)]
-    chip_html = "".join([f"<span style='padding:4px 10px;border:1px solid #94a3b8;border-radius:999px;margin-right:6px'>{t}</span>" for t in terms])
+    chip_html = "".join(
+        [
+            f"<span style='padding:4px 10px;border:1px solid #94a3b8;border-radius:999px;margin-right:6px'>{escape_html_text(t)}</span>"
+            for t in terms
+        ]
+    )
     if chip_html:
         st.markdown(f"<div>Filtros activos: {chip_html}</div>", unsafe_allow_html=True)
     for asset in assets:
@@ -4365,6 +5142,65 @@ def render_extra_page(config: AppConfig, assets: list[dict[str, Any]]) -> None:
     st.subheader("Extra analítico")
     st.caption("Este bloque es adicional y no reemplaza el inventario Jira.")
 
+    with st.expander("🔍 Diagnóstico de carga", expanded=False):
+        raw_assets = st.session_state.get("assets", [])
+        by_type = defaultdict(lambda: {"count": 0, "types": set()})
+        unknown_status = set()
+        missing_type = 0
+        missing_serial = 0
+        missing_hostname = 0
+        for a in raw_assets:
+            type_id = str(a.get("object_type_id") or "")
+            type_name = str(a.get("object_type") or "")
+            if not type_id:
+                missing_type += 1
+            by_type[type_id]["count"] += 1
+            if type_name:
+                by_type[type_id]["types"].add(type_name)
+            if not str(get_serial_value(a)).strip():
+                missing_serial += 1
+            if not str(get_hostname_value(a)).strip():
+                missing_hostname += 1
+            status_raw = normalize_text(a.get("status"))
+            allowed = {normalize_text(v) for v in ESTADO_NORMALIZATION.values()}
+            if status_raw and status_raw not in allowed:
+                unknown_status.add(str(a.get("status")))
+        diag_rows = []
+        for k, v in by_type.items():
+            diag_rows.append({"type_id": k or "(sin id)", "cantidad": v["count"], "tipos": ", ".join(sorted(v["types"]))})
+        st.dataframe(diag_rows, use_container_width=True, hide_index=True)
+        total_assets = max(len(raw_assets), 1)
+        st.write(f"Sin object_type_id: **{missing_type}**")
+        st.write(f"Sin serial: **{missing_serial}** ({round((missing_serial / total_assets) * 100, 2)}%)")
+        st.write(f"Sin hostname: **{missing_hostname}** ({round((missing_hostname / total_assets) * 100, 2)}%)")
+        st.write(f"Status desconocido: {', '.join(sorted(unknown_status)) if unknown_status else 'Ninguno'}")
+        discovered = st.session_state.get("discovered_type_ids", []) or []
+        all_schema_types = st.session_state.get("all_schema_type_ids", []) or []
+        active_scope = get_active_hardware_type_ids()
+        source = st.session_state.get("type_discovery_source", "fallback")
+        discovery_error = st.session_state.get("type_discovery_error", "")
+        st.write(
+            f"Tipos esquema total: **{len(all_schema_types)}** | descubiertos bajo {GENERAL_HARDWARE_TYPE_ID}: **{len(discovered)}** | "
+            f"hardcodeados: **{len(KNOWN_OBJECT_TYPE_IDS)}** | scope activo (incluye {GENERAL_HARDWARE_TYPE_ID}): **{len(active_scope)}** | fuente: **{source}**"
+        )
+        st.write(
+            f"Registros etapa base AQL: **{int(st.session_state.get('last_base_records_count', 0))}** | "
+            f"merge base+typeId: **{int(st.session_state.get('last_segmented_records_count', 0))}** | "
+            f"sumados por brute force: **{int(st.session_state.get('last_bruteforce_records_count', 0))}**"
+        )
+        st.write(
+            f"Type scan rango {TYPE_SCAN_START}-{TYPE_SCAN_END}: "
+            f"checados **{int(st.session_state.get('last_type_scan_checked', 0))}** | "
+            f"hits **{int(st.session_state.get('last_type_scan_hits', 0))}**"
+        )
+        if discovered:
+            st.caption(f"Descendientes de {GENERAL_HARDWARE_TYPE_ID}: {', '.join(discovered)}")
+        if discovery_error:
+            st.caption(f"Detalle discovery fallback: {discovery_error}")
+        st.caption("Cada objeto cargado incluye `attrs_by_name` y `attrs_by_id` con todos los atributos devueltos por Jira.")
+        st.write(f"Último AQL ejecutado: `{st.session_state.get('last_aql_executed', '')}`")
+        st.write(f"Tiempo última carga: **{st.session_state.get('last_load_seconds', 0.0)}s**")
+
     with st.expander("Puente Jira: Object Types y atributos", expanded=False):
         if st.button("Cargar mapeo de atributos Jira", use_container_width=True):
             st.session_state.schema_bridge = fetch_schema_bridge(config)
@@ -4442,23 +5278,23 @@ def render_extra_page(config: AppConfig, assets: list[dict[str, Any]]) -> None:
             if warranty:
                 delta = (warranty.date() - datetime.now().date()).days
                 if delta < 0:
-                    warr_color = "#dc2626"
+                    warr_color = "#991b1b"
                     warr_label = "Garantía vencida"
                 elif delta <= 45:
-                    warr_color = "#f59e0b"
+                    warr_color = "#a16207"
                     warr_label = f"Garantía vence en {delta} días"
                 else:
-                    warr_color = "#16a34a"
+                    warr_color = "#0f766e"
                     warr_label = "Garantía vigente"
             else:
-                warr_color = "#64748b"
+                warr_color = "#6b7280"
                 warr_label = "Sin dato de garantía"
             html = f"""
             <div style='border-left:4px solid #94a3b8;padding-left:16px'>
-              <div style='margin:8px 0'><span style='color:#2563eb;font-weight:700'>● Compra</span> — {purchase}</div>
-              <div style='margin:8px 0'><span style='color:#16a34a;font-weight:700'>● Alta Jira</span> — {created}</div>
-              <div style='margin:8px 0'><span style='color:#f59e0b;font-weight:700'>● Estado/Asignación</span> — {status} / {assigned}</div>
-              <div style='margin:8px 0'><span style='color:{warr_color};font-weight:700'>● Garantía</span> — {warr_label}</div>
+              <div style='margin:8px 0'><span style='color:#475569;font-weight:700'>● Compra</span> — {escape_html_text(purchase)}</div>
+              <div style='margin:8px 0'><span style='color:#0f766e;font-weight:700'>● Alta Jira</span> — {escape_html_text(created)}</div>
+              <div style='margin:8px 0'><span style='color:#334155;font-weight:700'>● Estado/Asignación</span> — {escape_html_text(status)} / {escape_html_text(assigned)}</div>
+              <div style='margin:8px 0'><span style='color:{warr_color};font-weight:700'>● Garantía</span> — {escape_html_text(warr_label)}</div>
             </div>
             """
             st.markdown(html, unsafe_allow_html=True)
@@ -4650,7 +5486,26 @@ def build_asset_attributes_payload(row: dict[str, Any]) -> tuple[str, list[dict[
 def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]]) -> None:
     """Renderiza la página de scripts: carga, modificación y reglas de normalización."""
     st.subheader("Scripts")
-    tab1, tab2, tab3, tab4 = st.tabs(["📥 Carga masiva", "✏️ Modificación masiva", "⚙️ Reglas de normalización", "🤖 Asignación automática"])
+    tab_config, tab1, tab2, tab3, tab4 = st.tabs(["⚙️ Configuración", "📥 Carga masiva", "✏️ Modificación masiva", "⚙️ Reglas de normalización", "🤖 Asignación automática"])
+    with tab_config:
+        st.markdown("**Opciones generales**")
+        c1, c2 = st.columns(2)
+        st.session_state.critical_threshold = c1.slider("Umbral periféricos críticos", 1, 50, int(st.session_state.get("critical_threshold", 10)))
+        st.session_state.cache_ttl_minutes = c2.slider("TTL caché (minutos)", 1, 60, int(st.session_state.get("cache_ttl_minutes", 10)))
+        st.session_state.use_ai_compact = st.checkbox("Usar IA compacta", value=bool(st.session_state.get("use_ai_compact", True)))
+        st.session_state.auto_clear_after_action = st.checkbox("Limpiar chat tras acciones", value=bool(st.session_state.get("auto_clear_after_action", True)))
+        st.markdown("**Log de errores HTTP**")
+        error_log = st.session_state.get("error_log", [])
+        if error_log:
+            st.dataframe(error_log[:20], use_container_width=True, hide_index=True)
+        else:
+            st.success("Sin errores registrados")
+        st.markdown("**Últimos movimientos**")
+        moves = st.session_state.get("movimientos", [])
+        if moves:
+            st.dataframe(moves[-10:][::-1], use_container_width=True, hide_index=True)
+        else:
+            st.info("Sin movimientos registrados")
     with tab1:
         uploaded = st.file_uploader("Subir Excel para carga masiva", type=["xlsx", "xls"], key="mass_upload")
         if uploaded is not None and pd is not None:
@@ -4693,7 +5548,7 @@ def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]]) -> None
                     progress.progress(min((idx + 1) / max(total_rows, 1), 1.0))
                 st.dataframe(results, use_container_width=True, hide_index=True)
                 if st.button("Refrescar inventario", key="refresh_after_load"):
-                    refresh_assets(config, st.session_state.aql_input)
+                    refresh_assets(config, st.session_state.aql_input, force_live=True)
     with tab2:
         uploaded_mod = st.file_uploader("Subir Excel para modificación masiva", type=["xlsx", "xls"], key="mass_update")
         if uploaded_mod is not None and pd is not None:
@@ -4713,6 +5568,8 @@ def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]]) -> None
                     type_id, attrs = build_asset_attributes_payload(row.to_dict())
                     if simulate:
                         results.append({"fila": idx + 1, "identificador": identifier, "ok": True, "detalle": f"Simulación ({len(attrs)} attrs)"})
+                    elif not attrs:
+                        results.append({"fila": idx + 1, "identificador": identifier, "ok": True, "detalle": "Sin cambios para aplicar"})
                     else:
                         ok, msg = update_asset_attributes(config, str(asset.get("object_id", "")), str(asset.get("object_type_id") or type_id), attrs)
                         if ok:
@@ -4749,8 +5606,10 @@ def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]]) -> None
             reglas = st.session_state.setdefault("reglas_guardadas", [])
             reglas.append(regla_actual.__dict__)
             st.session_state["reglas_guardadas"] = reglas
-            RULES_FILE.write_text(json.dumps(reglas, ensure_ascii=False, indent=2), encoding="utf-8")
-            st.success("Regla guardada.")
+            if save_normalization_rules(reglas):
+                st.success("Regla guardada.")
+            else:
+                st.error("No se pudo persistir la regla en disco.")
         if st.button("⚡ Aplicar regla", key="apply_rule"):
             updated, errors = aplicar_regla(config, assets, regla_actual, dry_run=False)
             st.success(f"Afectados: {updated}")
@@ -4768,10 +5627,8 @@ def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]]) -> None
             if c3.button("Eliminar", key=f"del_saved_{idx}"):
                 reglas = st.session_state.get("reglas_guardadas", [])
                 st.session_state["reglas_guardadas"] = [r for i, r in enumerate(reglas) if i != idx]
-                RULES_FILE.write_text(
-                    json.dumps(st.session_state["reglas_guardadas"], ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
+                if not save_normalization_rules(st.session_state["reglas_guardadas"]):
+                    st.error("No se pudo persistir la eliminación de la regla.")
     with tab4:
         scheduler_enabled = st.toggle(
             "Activar scheduler automático",
@@ -4830,8 +5687,10 @@ def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]]) -> None
             rules = st.session_state.get("auto_assign_rules", [])
             rules.append(regla_tmp.__dict__)
             st.session_state["auto_assign_rules"] = rules
-            save_auto_assign_rules(rules)
-            st.success("Regla automática guardada.")
+            if save_auto_assign_rules(rules):
+                st.success("Regla automática guardada.")
+            else:
+                st.error("No se pudo persistir la regla automática.")
         if crun.button("▶ Ejecutar job ahora", key="auto_rule_run_now"):
             resultados = auto_assign_job(config)
             st.session_state["auto_assign_log"] = load_auto_assign_log()
@@ -4846,10 +5705,12 @@ def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]]) -> None
             if c2.button("Toggle", key=f"auto_rule_toggle_{idx}"):
                 rules[idx]["activa"] = not bool(rules[idx].get("activa", True))
                 st.session_state["auto_assign_rules"] = rules
-                save_auto_assign_rules(rules)
+                if not save_auto_assign_rules(rules):
+                    st.error("No se pudo persistir el cambio de estado de la regla.")
             if c3.button("Eliminar", key=f"auto_rule_del_{idx}"):
                 st.session_state["auto_assign_rules"] = [x for i, x in enumerate(rules) if i != idx]
-                save_auto_assign_rules(st.session_state["auto_assign_rules"])
+                if not save_auto_assign_rules(st.session_state["auto_assign_rules"]):
+                    st.error("No se pudo persistir la eliminación de la regla.")
                 st.rerun()
 
         st.markdown("### Log (últimos 100)")
@@ -4862,238 +5723,53 @@ def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]]) -> None
 
 
 def render_chat_page(config: AppConfig, assets: list[dict[str, Any]]) -> None:
-    """Renderiza chat de inventario con confirmación visual y métricas en tiempo real."""
     all_assets = st.session_state.get("assets", assets)
-    st.subheader("Chat de inventario Uala")
-    st.caption(f"{len(assets)} activos cargados del esquema {SCHEMA_ID}")
     total = len(assets)
-    in_use = sum(1 for a in assets if normalize_text(a.get("status")) == normalize_text("en uso"))
-    stock = sum(1 for a in assets if normalize_text(a.get("status")) in {normalize_text("stock nuevo"), normalize_text("stock usado")})
-    p = round((in_use / max(total, 1)) * 100, 2)
-    m1, m2, m3 = st.columns(3)
-    m1.metric("📦 Total", total)
-    m2.metric("✅ En uso", f"{in_use} ({p}%)")
-    m3.metric("📬 Stock", stock)
+    in_use = sum(1 for a in assets if normalize_text(a.get("status", "")) == "en uso")
+    stock = sum(1 for a in assets if "stock" in normalize_text(a.get("status", "")))
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total", total)
+    m2.metric("En uso", f"{in_use} ({round(in_use / max(total, 1) * 100, 1)}%)")
+    m3.metric("Stock", stock)
+    m4.metric("Sin asignar", sum(1 for a in assets if not str(a.get("assigned_to") or "").strip()))
+    _render_pending_action_block(config, all_assets)
 
-    pending_action = st.session_state.get("pending_action")
-    if pending_action:
-        st.warning(f"Acción pendiente: {pending_action.get('summary', 'Revisar y confirmar')}")
-        c_ok, c_no = st.columns(2)
-        if c_ok.button("✅ Confirmar", use_container_width=True):
-            action = pending_action.get("action")
-            ok = False
-            answer = "Acción no válida."
-            if action == "assign":
-                ok, answer = assign_asset(config, all_assets, pending_action["identifier"], pending_action["assignee"])
-            elif action == "unassign":
-                ok, answer = unassign_asset(config, all_assets, pending_action["identifier"], pending_action.get("target_status", "Stock usado"))
-            elif action == "status":
-                ok, answer = update_status(config, all_assets, pending_action["identifier"], pending_action["new_status"])
-            elif action == "bulk":
-                updated, errors = bulk_update_location(config, all_assets, pending_action["identifiers"], pending_action["company"], pending_action["country"])
-                ok = updated > 0
-                answer = f"Bulk update aplicado. Actualizados: {updated}/{len(pending_action['identifiers'])}."
-                if errors:
-                    answer += " " + " | ".join(errors[:5])
-            elif action == "regla":
-                regla = pending_action["regla"]
-                rule_obj = ReglaNormalizacion(**regla) if isinstance(regla, dict) else regla
-                updated, errors = aplicar_regla(config, all_assets, rule_obj, dry_run=False)
-                ok = updated > 0
-                answer = f"Regla aplicada. Afectados: {updated}."
-                if errors:
-                    answer += " " + " | ".join(errors[:5])
-            st.session_state.pending_action = None
-            if ok:
-                refresh_assets(config, st.session_state.aql_input)
-                st.success(f"✅ {answer}")
-            else:
-                st.error(f"❌ {answer}")
-        if c_no.button("❌ Cancelar", use_container_width=True):
-            st.session_state.pending_action = None
-            st.info("ℹ️ Acción cancelada.")
+    suggestions = _build_contextual_suggestions(assets, st.session_state.get("anomaly_report", {}))
+    cols = st.columns(min(max(len(suggestions), 1), 4))
+    for i, sug in enumerate(suggestions[:4]):
+        if cols[i].button(sug, use_container_width=True, key=f"sug_{i}"):
+            _process_chat_prompt(config, all_assets, assets, sug)
+            st.rerun()
 
-    users = sorted({str(a.get("assigned_to") or "").strip() for a in assets if str(a.get("assigned_to") or "").strip()})
-    selected_user = st.selectbox("👤 Consultar usuario rápido", [""] + users, index=0)
-    if selected_user:
-        quick_prompt = f"¿Qué tiene asignado {selected_user}?"
-        quick_answer = answer_inventory_question(assets, quick_prompt)
-        st.session_state.chat_history.append({"role": "user", "content": quick_prompt})
-        st.session_state.chat_history.append({"role": "assistant", "content": quick_answer})
-        push_openai_history(quick_prompt, decode_chat_payload(quick_answer)[0])
-
-    anomaly = st.session_state.get("anomaly_report", {})
-    contextual: list[str] = []
-    if anomaly.get("en_uso_sin_asignado", 0) > 0:
-        contextual.append("¿Hay equipos en uso sin usuario asignado?")
-    if anomaly.get("serial_duplicado", 0) > 0:
-        contextual.append("Encontrá activos con serial duplicado")
-    if anomaly.get("garantia_vencida_en_uso", 0) > 0:
-        contextual.append("Listame activos en uso con garantía vencida")
-    if anomaly.get("hostname_duplicado", 0) > 0:
-        contextual.append("Mostrame duplicados de hostname")
-    total_assets = max(len(assets), 1)
-    sin_serial_pct = (sum(1 for a in assets if not str(get_serial_value(a)).strip()) / total_assets) * 100
-    sin_costo_pct = (sum(1 for a in assets if parse_cost(str(a.get("purchase_price", ""))) <= 0) / total_assets) * 100
-    garantia_45 = 0
-    now = datetime.now().date()
-    for a in assets:
-        w = parse_date(str(a.get("warranty_date", "")).split("|")[0].strip())
-        if w and 0 <= (w.date() - now).days <= 45:
-            garantia_45 += 1
-    if garantia_45 > 0:
-        contextual.append("¿Qué garantías vencen en los próximos 45 días?")
-    if sin_serial_pct > 10:
-        contextual.append("Mostrame activos sin serial cargado")
-    if sin_costo_pct > 20:
-        contextual.append("Mostrame activos sin costo cargado")
-    generic = [
-        "Resumen ejecutivo del inventario",
-        "¿Cuál es el activo más caro del inventario?",
-        "Top 5 usuarios con más equipos asignados",
-        "Comparar stock entre países",
-        "¿Qué garantías vencen en los próximos 30 días?",
-        "¿Cuántos activos no tienen serial cargado?",
-    ]
-    suggestions = (contextual[:2] + random.sample(generic, k=min(2, len(generic))))
-    cols = st.columns(max(len(suggestions), 1))
-    for idx, suggestion in enumerate(suggestions):
-        if cols[idx].button(suggestion, use_container_width=True):
-            response = answer_inventory_question(assets, suggestion)
-            st.session_state.chat_history.append({"role": "user", "content": suggestion})
-            st.session_state.chat_history.append({"role": "assistant", "content": response})
-            push_openai_history(suggestion, decode_chat_payload(response)[0])
-
-    for msg in st.session_state.chat_history:
+    for msg in st.session_state.get("chat_history", []):
         with st.chat_message(msg["role"]):
-            plain_content, charts = decode_chat_payload(msg.get("content"))
-            intro, table_df = parse_chat_response_for_table(plain_content)
-            st.markdown(intro)
+            plain, charts = decode_chat_payload(msg.get("content", ""))
+            intro, table_df = parse_chat_response_for_table(plain)
+            if intro:
+                st.markdown(intro)
             if table_df is not None:
                 st.dataframe(table_df, use_container_width=True, hide_index=True)
             for chart in charts:
                 if pio is None:
-                    st.caption(chart.get("title", "Gráfico no disponible"))
                     continue
                 try:
                     fig = pio.from_json(chart.get("figure_json", ""))
                     st.plotly_chart(fig, use_container_width=True)
                 except Exception:
-                    st.caption(chart.get("title", "No se pudo renderizar el gráfico"))
+                    st.caption(chart.get("title", ""))
 
-    prompt = st.chat_input("Preguntá por los activos de Uala")
-    if not prompt:
-        return
-    st.session_state.chat_history.append({"role": "user", "content": prompt})
-    normalized_prompt = normalize_text(prompt)
-
-    if normalized_prompt in {"si", "sí", "confirmar", "ok"} and st.session_state.get("pending_action"):
-        st.info("Usá el botón ✅ Confirmar para ejecutar la acción pendiente.")
-        return
-    if normalized_prompt in {"no", "cancelar"} and st.session_state.get("pending_action"):
-        st.session_state.pending_action = None
-        st.session_state.chat_history.append({"role": "assistant", "content": "ℹ️ Acción cancelada."})
+    prompt = st.chat_input("Preguntá por los activos de Uala...")
+    if prompt:
+        _process_chat_prompt(config, all_assets, assets, prompt)
         st.rerun()
-        return
-
-    regla = parse_normalization_rule_from_prompt(prompt)
-    if regla:
-        affected, _ = aplicar_regla(config, all_assets, regla, dry_run=True)
-        sample_matches = []
-        for a in all_assets:
-            if evaluar_regla(a, regla):
-                sample_matches.append(str(a.get("jira_key") or a.get("hostname") or a.get("name") or "N/A"))
-            if len(sample_matches) >= 5:
-                break
-        st.session_state.pending_action = {
-            "action": "regla",
-            "regla": regla.__dict__,
-            "summary": f"Aplicar regla `{regla.descripcion}`. Activos afectados: {affected}. Muestra: {', '.join(sample_matches) if sample_matches else 'sin coincidencias'}",
-        }
-        st.session_state.chat_history.append({"role": "assistant", "content": "ℹ️ Regla detectada. Confirmá con el botón para ejecutar."})
-        st.rerun()
-        return
-
-    assignment = parse_assignment_action(prompt)
-    if assignment:
-        identifier, assignee = assignment
-        st.session_state.pending_action = {
-            "action": "assign",
-            "identifier": identifier,
-            "assignee": assignee,
-            "summary": f"Asignar {identifier} a {assignee}",
-        }
-        st.session_state.chat_history.append({"role": "assistant", "content": "ℹ️ Acción detectada: asignación pendiente de confirmación."})
-        st.rerun()
-        return
-    unassign = parse_unassign_action(prompt)
-    if unassign:
-        identifier, target_status = unassign
-        st.session_state.pending_action = {
-            "action": "unassign",
-            "identifier": identifier,
-            "target_status": target_status,
-            "summary": f"Desasignar {identifier} y pasar a {target_status}",
-        }
-        st.session_state.chat_history.append({"role": "assistant", "content": "ℹ️ Acción detectada: desasignación pendiente de confirmación."})
-        st.rerun()
-        return
-    status_change = parse_status_change_action(prompt)
-    if status_change:
-        identifier, new_status = status_change
-        st.session_state.pending_action = {
-            "action": "status",
-            "identifier": identifier,
-            "new_status": new_status,
-            "summary": f"Cambiar estado de {identifier} a {new_status}",
-        }
-        st.session_state.chat_history.append({"role": "assistant", "content": "ℹ️ Acción detectada: cambio de estado pendiente de confirmación."})
-        st.rerun()
-        return
-    bulk = parse_bulk_location_action(prompt)
-    if bulk:
-        identifiers, company, country = bulk
-        st.session_state.pending_action = {
-            "action": "bulk",
-            "identifiers": identifiers,
-            "company": company,
-            "country": country,
-            "summary": f"Bulk update de {len(identifiers)} activos a {country}/{company}",
-        }
-        st.session_state.chat_history.append({"role": "assistant", "content": "ℹ️ Acción detectada: actualización masiva pendiente de confirmación."})
-        st.rerun()
-        return
-
-    dashboard_req = parse_nl_dashboard_request(prompt)
-    if dashboard_req:
-        st.session_state.insights_prompt = prompt
-        response = answer_inventory_question(assets, prompt)
-    else:
-        suggested_aql, notes = build_aql_from_prompt(prompt)
-        if suggested_aql:
-            try:
-                filtered = fetch_assets(config, suggested_aql)
-                response = (
-                    "### Traducción a AQL\n"
-                    f"`{suggested_aql}`\n\n"
-                    f"Resultado: **{len(filtered)}** activos.\n\n"
-                    f"{ai_compact_answer(config, prompt, filtered, notes, prefiltered=True) if st.session_state.get('use_ai_compact', True) else answer_inventory_question(filtered, prompt)}"
-                )
-            except RuntimeError as exc:
-                response = f"❌ Falló AQL ({exc}).\n{answer_inventory_question(assets, prompt)}"
-        else:
-            response = answer_inventory_question(assets, prompt)
-
-    st.session_state.chat_history.append({"role": "assistant", "content": response})
-    push_openai_history(prompt, decode_chat_payload(response)[0])
-    st.rerun()
 
 
 # ── 11. ENTRYPOINT ────────────────────────────────────────────────────────
 def main() -> None:
-    st.set_page_config(page_title="Uala Assets", page_icon="U", layout="wide")
+    st.set_page_config(page_title="Uala Assets", page_icon="U", layout="wide", initial_sidebar_state="collapsed")
     ensure_session_state()
     config = load_config()
+    apply_theme()
 
     missing = []
     if not config.jira_email:
@@ -5103,100 +5779,26 @@ def main() -> None:
     if not config.workspace_id:
         missing.append("ASSETS_WORKSPACE_ID / JIRA_WORKSPACE_ID")
 
-    if not config.jira_email or not config.jira_api_token:
-        render_setup_screen()
-        st.stop()
-
-    render_branding(config)
-
-    st.sidebar.title("Uala Control")
-    st.session_state.theme_mode = st.sidebar.selectbox("Tema", list(THEMES.keys()), index=list(THEMES.keys()).index(st.session_state.get("theme_mode", "Oscuro")))
-    page = st.sidebar.radio("Sección", ["Chat", "Activos", "Insights", "Auditoría", "Movimientos", "Scripts", "Extra"])
-    apply_theme(st.session_state.theme_mode)
-    st.sidebar.caption(f"Site: {config.site}")
-    st.sidebar.caption(f"Workspace: {config.workspace_id or 'no configurado'}")
-    st.sidebar.caption(f"Esquema: {SCHEMA_ID}")
-    active_type_ids = get_active_hardware_type_ids()
-    st.sidebar.caption(f"Scope hardware activo: {', '.join(active_type_ids)}")
-    st.sidebar.markdown("---")
-    st.sidebar.caption("Opciones IT")
-    st.session_state.critical_threshold = st.sidebar.slider("Umbral periféricos críticos", min_value=1, max_value=50, value=int(st.session_state.get("critical_threshold", 10)))
-    st.session_state.cache_ttl_minutes = st.sidebar.slider(
-        "TTL caché (minutos)",
-        min_value=1,
-        max_value=60,
-        value=int(st.session_state.get("cache_ttl_minutes", 10)),
-    )
-    st.session_state.use_ai_compact = st.sidebar.checkbox("Usar IA compacta (pocos tokens)", value=bool(st.session_state.get("use_ai_compact", True)))
-    st.session_state.auto_clear_after_action = st.sidebar.checkbox(
-        "Limpiar chat tras acciones",
-        value=bool(st.session_state.get("auto_clear_after_action", True)),
-        help="Cuando una acción (asignar/desasignar/cambiar estado) se ejecuta bien, limpia la conversación para seguir con otro caso.",
-    )
-    countries = sorted({str(a.get("country") or "Sin país") for a in st.session_state.get("assets", [])})
-    companies = sorted({str(a.get("company") or "Sin compañía") for a in st.session_state.get("assets", [])})
-    st.session_state.global_filter_countries = st.sidebar.multiselect(
-        "Filtro global por país",
-        countries,
-        default=st.session_state.get("global_filter_countries", []),
-    )
-    st.session_state.global_filter_companies = st.sidebar.multiselect(
-        "Filtro global por compañía",
-        companies,
-        default=st.session_state.get("global_filter_companies", []),
-    )
-    if st.sidebar.button("🧹 Limpiar filtros globales", use_container_width=True):
-        st.session_state.global_filter_countries = []
-        st.session_state.global_filter_companies = []
-
-    aql_text = st.sidebar.text_area("Filtro AQL adicional", value=st.session_state.aql_input, help="Opcional. Siempre dentro del esquema activo.", height=100)
-
-    expiry = st.session_state.get("cache_expiry")
-    if isinstance(expiry, datetime):
-        st.sidebar.caption(f"Caché válido hasta: {expiry.strftime('%H:%M:%S')}")
-    if st.sidebar.button("Refrescar inventario", use_container_width=True):
-        st.session_state.cache_hash = ""
-        st.session_state.cache_expiry = None
-        st.session_state.aql_input = aql_text.strip()
-        if missing:
-            st.session_state.last_error = "Faltan variables: " + ", ".join(missing)
-        else:
-            refresh_assets(config, st.session_state.aql_input)
-
-    if st.sidebar.button("Limpiar chat", use_container_width=True):
-        st.session_state.chat_history = []
-        st.session_state.openai_history = []
-        st.session_state.pending_action = None
-        st.session_state.last_action_result = ""
-    error_count = len(st.session_state.get("error_log", []))
-    log_label = f"🔴 Log de errores ({error_count})" if error_count else "Log de errores (0)"
-    with st.sidebar.expander(log_label, expanded=False):
-        for idx, err in enumerate(st.session_state.get("error_log", [])[:20], start=1):
-            st.caption(f"{idx}. {err.get('timestamp')} [{err.get('status_code')}] {err.get('method')} {err.get('url')}")
-    anomaly = st.session_state.get("anomaly_report", {})
-    total_anomaly = int(anomaly.get("total", 0))
-    if total_anomaly > 0:
-        st.sidebar.warning(f"⚠️ {total_anomaly} anomalías detectadas")
-    else:
-        st.sidebar.success("✅ Sin anomalías")
-    moves = st.session_state.get("movimientos", [])
-    today_s = datetime.now().date().isoformat()
-    today_moves = 0
-    for row in moves:
-        ts = str(row.get("timestamp", ""))
-        if ts.startswith(today_s):
-            today_moves += 1
-    with st.sidebar.expander("📋 Últimos movimientos", expanded=False):
-        st.caption(f"N total: {len(moves)} | hoy: {today_moves}")
-        for item in moves[-5:][::-1]:
-            st.write(f"{item.get('timestamp')} | {item.get('tipo_accion')} | {item.get('identificador')} | {item.get('resultado')}")
-    auto_log = st.session_state.get("auto_assign_log", [])
-    if auto_log:
-        st.sidebar.info(f"🤖 Asignaciones automáticas registradas: {len(auto_log)}")
-
     if missing:
+        render_setup_screen()
         st.error("Faltan variables requeridas: " + ", ".join(missing))
         st.stop()
+
+    params = st.query_params
+    page = params.get("page", "Chat")
+    valid_pages = ["Chat", "Activos", "Insights", "Auditoría", "Movimientos", "Scripts", "Extra"]
+    if page not in valid_pages:
+        page = "Chat"
+    debug_log(
+        f"main:page={page} assets_before={len(st.session_state.get('assets', []))} "
+        f"aql={st.session_state.get('aql_input', '')!r}"
+    )
+
+    raw_assets = st.session_state.assets
+    render_topbar(config, page, raw_assets)
+    render_filterbar(config)
+    if not raw_assets:
+        render_branding(config)
 
     if not st.session_state.assets:
         try:
@@ -5208,81 +5810,33 @@ def main() -> None:
         st.error(st.session_state.last_error)
         st.stop()
 
-    if st.session_state.last_sync:
-        st.caption(f"Última sincronización: {st.session_state.last_sync.strftime('%Y-%m-%d %H:%M:%S')}")
+    if not st.session_state.assets and not st.session_state.get("auto_reset_empty_once", False):
+        st.session_state["auto_reset_empty_once"] = True
+        st.session_state["cache_hash"] = ""
+        st.session_state["cache_expiry"] = None
+        st.session_state["aql_input"] = ""
+        st.session_state["global_filter_countries"] = []
+        st.session_state["global_filter_companies"] = []
+        try:
+            refresh_assets(config, "", force_live=True)
+        except Exception as exc:
+            st.session_state.last_error = str(exc)
+        st.rerun()
 
     raw_assets = st.session_state.assets
+    if raw_assets:
+        st.session_state["auto_reset_empty_once"] = False
     assets = apply_global_filter(raw_assets)
-    if st.session_state.get("global_filter_countries") or st.session_state.get("global_filter_companies"):
-        st.info(
-            f"Filtro global activo · Países: {', '.join(st.session_state.get('global_filter_countries', [])) or 'Todos'} · "
-            f"Compañías: {', '.join(st.session_state.get('global_filter_companies', [])) or 'Todas'}"
-        )
-    st.sidebar.caption(f"Activos cargados (raw): {len(raw_assets)}")
-    st.sidebar.caption(f"Activos visibles (filtrados): {len(assets)}")
-    with st.sidebar.expander("🔍 Diagnóstico de carga", expanded=False):
-        by_type = defaultdict(lambda: {"count": 0, "types": set()})
-        unknown_status = set()
-        missing_type = 0
-        missing_serial = 0
-        missing_hostname = 0
-        for a in raw_assets:
-            type_id = str(a.get("object_type_id") or "")
-            type_name = str(a.get("object_type") or "")
-            if not type_id:
-                missing_type += 1
-            by_type[type_id]["count"] += 1
-            if type_name:
-                by_type[type_id]["types"].add(type_name)
-            if not str(get_serial_value(a)).strip():
-                missing_serial += 1
-            if not str(get_hostname_value(a)).strip():
-                missing_hostname += 1
-            status_raw = normalize_text(a.get("status"))
-            allowed = {normalize_text(v) for v in ESTADO_NORMALIZATION.values()}
-            if status_raw and status_raw not in allowed:
-                unknown_status.add(str(a.get("status")))
-        diag_rows = []
-        for k, v in by_type.items():
-            diag_rows.append({"type_id": k or "(sin id)", "cantidad": v["count"], "tipos": ", ".join(sorted(v["types"]))})
-        st.dataframe(diag_rows, use_container_width=True, hide_index=True)
-        total_assets = max(len(raw_assets), 1)
-        st.write(f"Sin object_type_id: **{missing_type}**")
-        st.write(f"Sin serial: **{missing_serial}** ({round((missing_serial/total_assets)*100,2)}%)")
-        st.write(f"Sin hostname: **{missing_hostname}** ({round((missing_hostname/total_assets)*100,2)}%)")
-        st.write(f"Status desconocido: {', '.join(sorted(unknown_status)) if unknown_status else 'Ninguno'}")
-        discovered = st.session_state.get("discovered_type_ids", []) or []
-        all_schema_types = st.session_state.get("all_schema_type_ids", []) or []
-        active_scope = get_active_hardware_type_ids()
-        source = st.session_state.get("type_discovery_source", "fallback")
-        discovery_error = st.session_state.get("type_discovery_error", "")
-        st.write(
-            f"Tipos esquema total: **{len(all_schema_types)}** | descubiertos bajo {GENERAL_HARDWARE_TYPE_ID}: **{len(discovered)}** | hardcodeados: **{len(KNOWN_OBJECT_TYPE_IDS)}** | "
-            f"scope activo (incluye {GENERAL_HARDWARE_TYPE_ID}): **{len(active_scope)}** | fuente: **{source}**"
-        )
-        st.write(
-            f"Registros etapa base AQL: **{int(st.session_state.get('last_base_records_count', 0))}** | "
-            f"merge base+typeId: **{int(st.session_state.get('last_segmented_records_count', 0))}** | "
-            f"sumados por brute force: **{int(st.session_state.get('last_bruteforce_records_count', 0))}**"
-        )
-        st.write(
-            f"Type scan rango {TYPE_SCAN_START}-{TYPE_SCAN_END}: "
-            f"checados **{int(st.session_state.get('last_type_scan_checked', 0))}** | "
-            f"hits **{int(st.session_state.get('last_type_scan_hits', 0))}**"
-        )
-        if discovered:
-            st.caption(f"Descendientes de {GENERAL_HARDWARE_TYPE_ID}: {', '.join(discovered)}")
-        if discovery_error:
-            st.caption(f"Detalle discovery fallback: {discovery_error}")
-        st.caption("Cada objeto cargado incluye `attrs_by_name` y `attrs_by_id` con todos los atributos devueltos por Jira.")
-        st.write(f"Último AQL ejecutado: `{st.session_state.get('last_aql_executed','')}`")
-        st.write(f"Tiempo última carga: **{st.session_state.get('last_load_seconds',0.0)}s**")
-    if page == "Insights":
-        render_insights(assets)
+    debug_log(f"main:render page={page} raw_assets={len(raw_assets)} visible_assets={len(assets)}")
+    if raw_assets and not assets:
+        st.warning("No hay activos visibles con los filtros actuales. Limpié país/compañía o usá el botón ✕.")
+
+    if page == "Chat":
+        render_chat_page(config, assets)
     elif page == "Activos":
         render_assets_page(assets)
-    elif page == "Chat":
-        render_chat_page(config, assets)
+    elif page == "Insights":
+        render_insights(assets)
     elif page == "Auditoría":
         render_auditoria_page(config, assets)
     elif page == "Movimientos":
