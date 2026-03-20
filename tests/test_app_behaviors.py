@@ -209,7 +209,8 @@ class TestScriptInputs(unittest.TestCase):
             {"id": app.ID_HOSTNAME, "name": "Hostname", "defaultType": {"name": "Text"}},
             {"id": app.ID_SERIAL, "name": "Serial Number", "defaultType": {"name": "Text"}},
             {"id": app.ID_ESTADO, "name": "Estado del activo", "defaultType": {"name": "Status"}},
-            {"id": app.ID_ASIGNACION, "name": "Usuario asignado", "defaultType": {"name": "User"}},
+            {"id": app.ID_USUARIO_ASIGNADO, "name": "Usuario asignado", "defaultType": {"name": "User"}},
+            {"id": app.ID_ASIGNACION, "name": "Asignacion", "referenceObjectType": {"id": "1232-ref"}},
             {"id": app.ID_CATEGORIA, "name": "Categoria", "referenceObjectType": {"id": "1300-ref"}},
             {"id": app.ID_COMPANIA, "name": "Compañía", "referenceObjectType": {"id": "1337-ref"}},
         ]
@@ -219,6 +220,8 @@ class TestScriptInputs(unittest.TestCase):
                 return "CAT-1"
             if reference_type_id == "1337-ref" and raw_value == "Bancar ARG":
                 return "COM-1"
+            if reference_type_id == "1232-ref" and raw_value == "ana@bancar.com":
+                return "PER-1"
             return None
 
         def fake_option_lookup(_config, attr_id, _auth, _headers):
@@ -236,7 +239,8 @@ class TestScriptInputs(unittest.TestCase):
         self.assertEqual(type_id, app.CATEGORY_TO_TYPE_ID["portatiles"])
         self.assertEqual(issues, [])
         self.assertEqual(attr_map[app.ID_ESTADO], "STATUS-1")
-        self.assertEqual(attr_map[app.ID_ASIGNACION], "acc-123")
+        self.assertEqual(attr_map[app.ID_ASIGNACION], "PER-1")
+        self.assertEqual(attr_map[app.ID_USUARIO_ASIGNADO], "acc-123")
         self.assertEqual(attr_map[app.ID_CATEGORIA], "CAT-1")
         self.assertEqual(attr_map[app.ID_COMPANIA], "COM-1")
 
@@ -277,6 +281,47 @@ class TestScriptInputs(unittest.TestCase):
         self.assertNotIn(app.ID_SERIAL, attr_map)
         self.assertEqual(attr_map[app.ID_HOSTNAME], "NB-01-NEW")
         self.assertEqual(attr_map[app.ID_ESTADO], "STATUS-2")
+
+    def test_build_asset_update_payload_writes_assignment_reference_and_user(self) -> None:
+        config = app.AppConfig(
+            jira_email="jira@example.com",
+            jira_api_token="token",
+            workspace_id="workspace",
+            site="https://bancar.atlassian.net",
+            openai_api_key="",
+            openai_model="gpt-4o-mini",
+            rovo_api_key="",
+            rovo_enabled=False,
+        )
+        row = {
+            "Serial Number": "SER-001",
+            "Usuario asignado": "ana@bancar.com",
+        }
+        attr_defs = [
+            {"id": app.ID_SERIAL, "name": "Serial Number", "defaultType": {"name": "Text"}},
+            {"id": app.ID_USUARIO_ASIGNADO, "name": "Usuario asignado", "defaultType": {"name": "User"}},
+            {"id": app.ID_ASIGNACION, "name": "Asignacion", "referenceObjectType": {"id": "1232-ref"}},
+        ]
+
+        def fake_ref_resolver(_config, reference_type_id, raw_value, _auth, *, attr_id="", headers=None):
+            if reference_type_id == "1232-ref" and raw_value == "ana@bancar.com":
+                return "PER-1"
+            return None
+
+        with (
+            mock.patch.object(app, "fetch_object_type_attributes", return_value=attr_defs),
+            mock.patch.object(app, "resolve_reference_object_key", side_effect=fake_ref_resolver),
+            mock.patch.object(app, "resolve_user_account_id", return_value="acc-123"),
+            mock.patch.object(app, "fetch_attribute_option_lookup", return_value={}),
+        ):
+            type_id, attrs, issues = app.build_asset_update_payload(config, "213", row)
+
+        attr_map = self._attr_map(attrs)
+        self.assertEqual(type_id, "213")
+        self.assertEqual(issues, [])
+        self.assertNotIn(app.ID_SERIAL, attr_map)
+        self.assertEqual(attr_map[app.ID_ASIGNACION], "PER-1")
+        self.assertEqual(attr_map[app.ID_USUARIO_ASIGNADO], "acc-123")
 
     def test_cached_fetch_assets_prefers_live_empty_result_over_stale_snapshot(self) -> None:
         config = app.AppConfig(
@@ -652,6 +697,37 @@ class TestScriptInputs(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("404", msg)
         self.assertIn("not found", msg)
+
+    def test_clean_asset_object_prefers_user_email_for_assigned_to(self) -> None:
+        asset = {
+            "id": "32539",
+            "objectTypeId": "213",
+            "objectKey": "ISI-32539",
+            "label": "NB-01",
+            "objectType": {"id": "213", "name": "Portátiles"},
+            "attributes": [
+                {
+                    "objectTypeAttribute": {"id": app.ID_ASIGNACION, "name": "Asignacion"},
+                    "objectAttributeValues": [{"displayValue": "Consumible.Mouse - prueba - Matias Daniel Vazquez"}],
+                },
+                {
+                    "objectTypeAttribute": {"id": app.ID_USUARIO_ASIGNADO, "name": "Usuario asignado"},
+                    "objectAttributeValues": [
+                        {
+                            "displayValue": "Matias Daniel Vazquez",
+                            "value": {
+                                "displayValue": "Matias Daniel Vazquez",
+                                "emailAddress": "matias.vazquez@uala.com.ar",
+                            },
+                        }
+                    ],
+                },
+            ],
+        }
+
+        record = app.clean_asset_object(asset)
+
+        self.assertEqual(record.assigned_to, "matias.vazquez@uala.com.ar")
 
 
 class TestChatDashboardIntegration(unittest.TestCase):

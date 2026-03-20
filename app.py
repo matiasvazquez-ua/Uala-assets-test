@@ -135,6 +135,7 @@ ID_FECHA_GARANTIA = "1089"
 ID_COSTO = "1090"
 ID_SERIAL = "1091"
 ID_PAIS = "1092"
+ID_USUARIO_ASIGNADO = "1042"
 ID_ASIGNACION = "1232"
 ID_PROVEEDOR = "1265"
 ID_CATEGORIA = "1300"
@@ -396,6 +397,7 @@ SCHEMA_MINI = {
         {"id": ID_HOSTNAME, "name": "Hostname"},
         {"id": ID_SERIAL, "name": "Serial Number"},
         {"id": ID_ESTADO, "name": "Estado del activo"},
+        {"id": ID_USUARIO_ASIGNADO, "name": "Usuario asignado"},
         {"id": ID_ASIGNACION, "name": "Usuario asignado"},
         {"id": ID_MODELO, "name": "Nombre del modelo"},
         {"id": ID_PAIS, "name": "Pais"},
@@ -1976,6 +1978,54 @@ def resolve_mass_upload_attribute_value(
     return value, ""
 
 
+def build_assignment_payloads(
+    config: AppConfig,
+    raw_value: Any,
+    auth: BasicAuth,
+    headers: dict[str, str],
+    attr_defs_by_id: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Resuelve mail de usuario a referencia de persona y user attribute."""
+    raw = normalize_tabular_value(raw_value)
+    if not raw:
+        return [], []
+
+    payloads: list[dict[str, Any]] = []
+    issues: list[str] = []
+
+    reference_def = attr_defs_by_id.get(ID_ASIGNACION)
+    if reference_def:
+        resolved_reference, issue = resolve_mass_upload_attribute_value(
+            config,
+            ID_ASIGNACION,
+            raw,
+            reference_def,
+            auth,
+            headers,
+        )
+        if issue:
+            issues.append(issue)
+        elif resolved_reference not in (None, ""):
+            payloads.append({"objectTypeAttributeId": ID_ASIGNACION, "objectAttributeValues": [{"value": resolved_reference}]})
+
+    user_def = attr_defs_by_id.get(ID_USUARIO_ASIGNADO)
+    if user_def:
+        resolved_user, issue = resolve_mass_upload_attribute_value(
+            config,
+            ID_USUARIO_ASIGNADO,
+            raw,
+            user_def,
+            auth,
+            headers,
+        )
+        if issue:
+            issues.append(issue)
+        elif resolved_user not in (None, ""):
+            payloads.append({"objectTypeAttributeId": ID_USUARIO_ASIGNADO, "objectAttributeValues": [{"value": resolved_user}]})
+
+    return payloads, issues
+
+
 def build_asset_create_payload(config: AppConfig, row: dict[str, Any]) -> tuple[str, list[dict[str, Any]], list[str]]:
     """Arma payload de alta resolviendo referencias, usuarios y opciones."""
     type_id, attrs = build_asset_attributes_payload(row)
@@ -1991,6 +2041,12 @@ def build_asset_create_payload(config: AppConfig, row: dict[str, Any]) -> tuple[
         raw_values = attr.get("objectAttributeValues") or []
         raw_value = raw_values[0].get("value") if raw_values else ""
         attr_def = attr_defs_by_id.get(attr_id, {})
+
+        if attr_id == ID_ASIGNACION:
+            assignment_attrs, assignment_issues = build_assignment_payloads(config, raw_value, auth, headers, attr_defs_by_id)
+            issues.extend(assignment_issues)
+            resolved_attrs.extend(assignment_attrs)
+            continue
 
         resolved_value, issue = resolve_mass_upload_attribute_value(config, attr_id, raw_value, attr_def, auth, headers)
         if issue:
@@ -2667,6 +2723,19 @@ def extract_attr_text(attribute: dict[str, Any]) -> str:
     return " | ".join(unique)
 
 
+def extract_user_email_from_attribute(attribute: dict[str, Any]) -> str:
+    for item in attribute.get("objectAttributeValues", []) or []:
+        raw = item.get("value")
+        if isinstance(raw, dict):
+            email = str(raw.get("emailAddress") or raw.get("email") or "").strip()
+            if email:
+                return email
+        display = str(item.get("displayValue") or "").strip()
+        if re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", display):
+            return display
+    return ""
+
+
 def get_attr_value(attrs_by_id: dict[str, str], attrs_by_name: dict[str, str], preferred_id: str, alias_names: list[str]) -> str:
     value_by_id = str(attrs_by_id.get(preferred_id, "")).strip()
     if value_by_id:
@@ -2691,12 +2760,17 @@ def clean_asset_object(asset: dict[str, Any]) -> AssetRecord:
     attrs_by_id: dict[str, str] = {}
     attrs_by_name: dict[str, str] = {}
     attr_name_to_id: dict[str, str] = {}
+    user_assignment_email = ""
 
     for attribute in asset.get("attributes", []):
         meta = attribute.get("objectTypeAttribute", {})
         attr_id = str(meta.get("id", "")).strip()
         attr_name = str(meta.get("name", "")).strip()
         attr_value = extract_attr_text(attribute)
+        if attr_id == ID_USUARIO_ASIGNADO:
+            user_assignment_email = extract_user_email_from_attribute(attribute) or attr_value
+            if user_assignment_email:
+                attr_value = user_assignment_email
         if not attr_value:
             continue
         if attr_id:
@@ -2710,7 +2784,12 @@ def clean_asset_object(asset: dict[str, Any]) -> AssetRecord:
     category_raw = get_attr_value(attrs_by_id, attrs_by_name, ID_CATEGORIA, ["Categoria", "Category"])
     status_raw = get_attr_value(attrs_by_id, attrs_by_name, ID_ESTADO, ["Estado", "Estado del activo", "Status"])
     country_raw = get_attr_value(attrs_by_id, attrs_by_name, ID_PAIS, ["Pais", "País", "Country"])
-    assigned_raw = get_attr_value(
+    assigned_raw = user_assignment_email or get_attr_value(
+        attrs_by_id,
+        attrs_by_name,
+        ID_USUARIO_ASIGNADO,
+        ["Usuario asignado", "Assigned To", "User assigned"],
+    ) or get_attr_value(
         attrs_by_id,
         attrs_by_name,
         ID_ASIGNACION,
@@ -3474,24 +3553,24 @@ def assign_asset(config: AppConfig, assets: list[dict[str, Any]], identifier: st
     candidate = find_asset_by_identifier(assets, identifier)
     if not candidate:
         return False, f"No encontré activo `{identifier}`."
-    auth, _ = build_auth_headers(config)
-    assignee_value: str = user_email_or_name
-    account_id = resolve_user_account_id(config, user_email_or_name, auth)
-    if account_id:
-        assignee_value = account_id
-    assignee_attr_id = resolve_attr_id(
-        candidate,
-        ["Usuario asignado", "Asignado a", "Assigned To", "User assigned", "Asignación", "Asignacion"],
-        ID_ASIGNACION,
+    auth, headers = build_auth_headers(config)
+    attr_defs = fetch_object_type_attributes(config, str(candidate.get("object_type_id", "")), auth, headers)
+    attr_defs_by_id = {str(attr.get("id") or "").strip(): attr for attr in attr_defs if str(attr.get("id") or "").strip()}
+    assignment_attrs, assignment_issues = build_assignment_payloads(
+        config,
+        user_email_or_name,
+        auth,
+        headers,
+        attr_defs_by_id,
     )
     status_attr_id = resolve_attr_id(candidate, ["Estado del activo", "Estado", "Status"], ID_ESTADO)
-    attrs_payload = []
-    if assignee_attr_id:
-        attrs_payload.append({"objectTypeAttributeId": assignee_attr_id, "objectAttributeValues": [{"value": assignee_value}]})
+    attrs_payload = list(assignment_attrs)
     if status_attr_id:
         attrs_payload.append({"objectTypeAttributeId": status_attr_id, "objectAttributeValues": [{"value": "En uso"}]})
     if not attrs_payload:
         return False, f"No encontré atributos actualizables en `{candidate.get('jira_key') or candidate.get('name')}`."
+    if assignment_issues:
+        return False, " | ".join(assignment_issues[:3])
 
     before_assignee = str(candidate.get("assigned_to") or "")
     ok, msg = update_asset_attributes(
@@ -3521,16 +3600,15 @@ def unassign_asset(config: AppConfig, assets: list[dict[str, Any]], identifier: 
     if not candidate:
         return False, f"No encontré activo `{identifier}`."
 
-    assignee_attr_id = resolve_attr_id(
-        candidate,
-        ["Usuario asignado", "Asignado a", "Assigned To", "User assigned", "Asignación", "Asignacion"],
-        ID_ASIGNACION,
-    )
+    assignee_attr_id = resolve_attr_id(candidate, ["Asignación", "Asignacion"], ID_ASIGNACION)
+    user_assignee_attr_id = resolve_attr_id(candidate, ["Usuario asignado", "Assigned To", "User assigned"], ID_USUARIO_ASIGNADO)
     status_attr_id = resolve_attr_id(candidate, ["Estado del activo", "Estado", "Status"], ID_ESTADO)
 
     attrs_payload = []
     if assignee_attr_id:
         attrs_payload.append({"objectTypeAttributeId": assignee_attr_id, "objectAttributeValues": []})
+    if user_assignee_attr_id and user_assignee_attr_id != assignee_attr_id:
+        attrs_payload.append({"objectTypeAttributeId": user_assignee_attr_id, "objectAttributeValues": []})
     if status_attr_id:
         attrs_payload.append({"objectTypeAttributeId": status_attr_id, "objectAttributeValues": [{"value": target_status}]})
     if not attrs_payload:
@@ -6249,6 +6327,11 @@ def build_asset_update_payload(config: AppConfig, object_type_id: str, row: dict
             continue
         raw_values = attr.get("objectAttributeValues") or []
         raw_value = raw_values[0].get("value") if raw_values else ""
+        if attr_id == ID_ASIGNACION:
+            assignment_attrs, assignment_issues = build_assignment_payloads(config, raw_value, auth, headers, attr_defs_by_id)
+            issues.extend(assignment_issues)
+            resolved_attrs.extend(assignment_attrs)
+            continue
         resolved_value, issue = resolve_mass_upload_attribute_value(config, attr_id, raw_value, attr_def, auth, headers)
         if issue:
             issues.append(issue)
