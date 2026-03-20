@@ -1985,7 +1985,6 @@ def build_assignment_payloads(
     headers: dict[str, str],
     attr_defs_by_id: dict[str, dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Resuelve mail de usuario a referencia de persona y user attribute."""
     raw = normalize_tabular_value(raw_value)
     if not raw:
         return [], []
@@ -1993,38 +1992,41 @@ def build_assignment_payloads(
     payloads: list[dict[str, Any]] = []
     issues: list[str] = []
 
+    # Primero resolver el accountId real (igual que asset_masivo.py tipo "2")
+    account_id = resolve_user_account_id(config, raw, auth)
+
+    # Campo usuario (ID_USUARIO_ASIGNADO = 1042) — siempre con accountId
+    if account_id:
+        payloads.append({
+            "objectTypeAttributeId": ID_USUARIO_ASIGNADO,
+            "objectAttributeValues": [{"value": account_id}]
+        })
+    else:
+        issues.append(f"No se encontró el usuario `{raw}` en Jira.")
+
+    # Campo referencia (ID_ASIGNACION = 1232) — intentar resolver como objeto
+    # pero sin bloquear si falla, es secundario
     reference_def = attr_defs_by_id.get(ID_ASIGNACION)
-    if reference_def:
-        resolved_reference, issue = resolve_mass_upload_attribute_value(
-            config,
-            ID_ASIGNACION,
-            raw,
-            reference_def,
-            auth,
-            headers,
-        )
-        if issue:
-            issues.append(issue)
-        elif resolved_reference not in (None, ""):
-            payloads.append({"objectTypeAttributeId": ID_ASIGNACION, "objectAttributeValues": [{"value": resolved_reference}]})
+    if reference_def and account_id:
+        reference_object_type_id = str(
+            (reference_def.get("referenceObjectType") or {}).get("id") or ""
+        ).strip()
+        if reference_object_type_id:
+            resolved_reference = resolve_reference_object_key(
+                config,
+                reference_object_type_id,
+                raw,
+                auth,
+                attr_id=ID_ASIGNACION,
+                headers=headers,
+            )
+            if resolved_reference:
+                payloads.append({
+                    "objectTypeAttributeId": ID_ASIGNACION,
+                    "objectAttributeValues": [{"value": resolved_reference}]
+                })
 
-    user_def = attr_defs_by_id.get(ID_USUARIO_ASIGNADO)
-    if user_def:
-        resolved_user, issue = resolve_mass_upload_attribute_value(
-            config,
-            ID_USUARIO_ASIGNADO,
-            raw,
-            user_def,
-            auth,
-            headers,
-        )
-        if issue:
-            issues.append(issue)
-        elif resolved_user not in (None, ""):
-            payloads.append({"objectTypeAttributeId": ID_USUARIO_ASIGNADO, "objectAttributeValues": [{"value": resolved_user}]})
-
-    return payloads, issues
-
+    return payloads, issues if not payloads else []
 
 def build_asset_create_payload(config: AppConfig, row: dict[str, Any]) -> tuple[str, list[dict[str, Any]], list[str]]:
     """Arma payload de alta resolviendo referencias, usuarios y opciones."""
