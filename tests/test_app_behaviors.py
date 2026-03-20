@@ -570,6 +570,29 @@ class TestScriptInputs(unittest.TestCase):
 
         self.assertEqual(lookup[app.normalize_lookup_key("matias.vazquez@uala.com.ar")], "USR-1")
 
+    def test_fetch_reference_object_lookup_requests_large_page_with_query_params(self) -> None:
+        config = app.AppConfig(
+            jira_email="jira@example.com",
+            jira_api_token="token",
+            workspace_id="workspace",
+            site="https://bancar.atlassian.net",
+            openai_api_key="",
+            openai_model="gpt-4o-mini",
+            rovo_api_key="",
+            rovo_enabled=False,
+        )
+        response = mock.Mock()
+        response.json.return_value = {"values": []}
+        app.st.session_state.clear()
+        with mock.patch.object(app, "jira_request_with_retry", return_value=response) as request_mock:
+            app.fetch_reference_object_lookup(config, "1232-ref", mock.Mock(), {})
+
+        first_call = request_mock.call_args_list[0]
+        self.assertEqual(first_call.kwargs["params"]["maxResults"], 1000)
+        self.assertEqual(first_call.kwargs["params"]["startAt"], 0)
+        self.assertTrue(first_call.kwargs["params"]["includeAttributes"])
+        self.assertEqual(first_call.kwargs["json_payload"]["resultsPerPage"], 1000)
+
     def test_warranty_date_is_sent_as_jira_datetime(self) -> None:
         config = app.AppConfig(
             jira_email="jira@example.com",

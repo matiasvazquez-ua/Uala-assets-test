@@ -1762,6 +1762,7 @@ def fetch_reference_object_lookup(
         f"{config.site}/rest/servicedeskapi/assets/workspace/{config.workspace_id}/v1/object/aql",
     ]
     lookup: dict[str, str] = {}
+    page_size = 1000
     for url in urls:
         start_at = 0
         while True:
@@ -1771,11 +1772,17 @@ def fetch_reference_object_lookup(
                     url,
                     auth=auth,
                     headers=headers,
+                    params={
+                        "includeAttributes": True,
+                        "startAt": start_at,
+                        "maxResults": page_size,
+                    },
                     json_payload={
                         "qlQuery": f"objectTypeId = {cache_key}",
                         "includeAttributes": True,
-                        "maxResults": 200,
+                        "maxResults": page_size,
                         "startAt": start_at,
+                        "resultsPerPage": page_size,
                     },
                 )
             except Exception:
@@ -1797,9 +1804,9 @@ def fetch_reference_object_lookup(
                     for attr_value in iter_attribute_lookup_values(attribute):
                         register_lookup_alias(attr_value, object_key)
 
-            if len(values) < 200:
+            if len(values) < page_size:
                 break
-            start_at += 200
+            start_at += page_size
 
     cache[cache_key] = dict(lookup)
     return lookup
