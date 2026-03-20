@@ -363,6 +363,44 @@ MASS_UPDATE_IDENTIFIER_ALIASES = [
     "Identifier",
     "Asset Key",
 ]
+CONSUMIBLES_ASSIGNMENT_TYPE_ID = "230"
+CONSUMIBLES_OBJECT_TYPE_ID = "225"
+ID_CONSUMIBLES_ASSIGNMENT_NAME = "1061"
+ID_CONSUMIBLES_ASSIGNMENT_USER = "1062"
+ID_CONSUMIBLES_ASSIGNMENT_CONSUMIBLE = "1063"
+ID_CONSUMIBLES_ASSIGNMENT_QTY = "1064"
+ID_CONSUMIBLES_ASSIGNMENT_DATE = "1065"
+ID_CONSUMIBLES_ASSIGNMENT_TICKET = "1066"
+CONSUMIBLES_TEMPLATE_HEADERS = [
+    "Name (1061)",
+    "Usuario asignado (1062)",
+    "Consumibles (1063)",
+    "Cantidad (1064)",
+    "Fecha de asignacion (1065)",
+    "Ticket Jira (1066)",
+]
+CONSUMIBLES_REQUIRED_HEADERS = [
+    "Usuario asignado (1062)",
+    "Consumibles (1063)",
+    "Cantidad (1064)",
+]
+CONSUMIBLES_REQUIRED_HEADER_SET = set(CONSUMIBLES_REQUIRED_HEADERS)
+CONSUMIBLES_TEMPLATE_EXAMPLE_ROW = {
+    "Name (1061)": "matias - hub x1",
+    "Usuario asignado (1062)": "matias.vazquez@uala.com.ar",
+    "Consumibles (1063)": "hub",
+    "Cantidad (1064)": "1",
+    "Fecha de asignacion (1065)": "2026-03-20",
+    "Ticket Jira (1066)": "SDI-123",
+}
+CONSUMIBLES_COLUMN_ALIASES = {
+    "name": ["Name", "Name (1061)", "Nombre", "Nombre (1061)"],
+    "user": ["Usuario asignado", "Usuario asignado (1062)", "Assigned To", "Usuario", "Email"],
+    "consumible": ["Consumibles", "Consumibles (1063)", "Consumible", "Consumible (1063)", "Item", "SKU"],
+    "quantity": ["Cantidad", "Cantidad (1064)", "Qty", "Quantity"],
+    "assignment_date": ["Fecha de asignacion", "Fecha de asignación", "Fecha de asignacion (1065)", "Fecha de asignación (1065)", "Fecha"],
+    "ticket": ["Ticket Jira", "Ticket Jira (1066)", "Ticket", "Issue", "Issue Key"],
+}
 CHAT_PAYLOAD_PREFIX = "__CHAT_PAYLOAD__::"
 
 THEMES = {
@@ -6516,10 +6554,156 @@ def resolve_mass_update_identifier(row: dict[str, Any]) -> str:
     return get_row_value_by_aliases(row_lookup, MASS_UPLOAD_COLUMN_ALIASES["serial"])
 
 
+def is_consumibles_example_row(row: dict[str, Any]) -> bool:
+    """Detecta la fila de ejemplo incluida en la plantilla de consumibles."""
+    row_lookup = build_row_lookup(row)
+    for header, expected in CONSUMIBLES_TEMPLATE_EXAMPLE_ROW.items():
+        actual = get_row_value_by_aliases(row_lookup, [header])
+        if normalize_tabular_value(actual) != normalize_tabular_value(expected):
+            return False
+    return True
+
+
+def build_consumibles_template_bytes() -> bytes:
+    """Genera una plantilla Excel para asignaciones masivas de consumibles."""
+    if Workbook is None or Font is None or PatternFill is None or Alignment is None or get_column_letter is None:
+        raise RuntimeError("openpyxl no está disponible para generar la plantilla.")
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Consumibles"
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(CONSUMIBLES_TEMPLATE_HEADERS))}2"
+
+    header_fill = PatternFill(start_color="003262", end_color="003262", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+    required_fill = PatternFill(start_color="D4A12A", end_color="D4A12A", fill_type="solid")
+    example_fill = PatternFill(start_color="F6F8FC", end_color="F6F8FC", fill_type="solid")
+
+    for col_idx, header in enumerate(CONSUMIBLES_TEMPLATE_HEADERS, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.font = header_font
+        cell.fill = required_fill if header in CONSUMIBLES_REQUIRED_HEADER_SET else header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        example_value = CONSUMIBLES_TEMPLATE_EXAMPLE_ROW.get(header, "")
+        example_cell = ws.cell(row=2, column=col_idx, value=example_value)
+        example_cell.fill = example_fill
+        example_cell.alignment = Alignment(vertical="center")
+
+    for col_idx, header in enumerate(CONSUMIBLES_TEMPLATE_HEADERS, start=1):
+        values = [f"{header} *" if header in CONSUMIBLES_REQUIRED_HEADER_SET else header]
+        max_len = max(len(str(item or "")) for item in values + [CONSUMIBLES_TEMPLATE_EXAMPLE_ROW.get(header, "")])
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len + 4, 18), 36)
+
+    ws_help = wb.create_sheet("Instrucciones")
+    instructions = [
+        ("Objetivo", "Completar una fila por asignación de consumible y subir el archivo desde Scripts > Consumibles."),
+        ("Campos obligatorios", ", ".join(CONSUMIBLES_REQUIRED_HEADERS)),
+        ("Usuario asignado", "Informar mail o nombre de usuario resoluble en Jira."),
+        ("Consumibles", "Usar el nombre, alias o key del consumible cargado en Assets typeId 225. Ejemplo: hub."),
+        ("Cantidad", "Debe ser un entero mayor a cero."),
+        ("Stock", "La app crea un objeto en Asignaciones (typeId 230). Jira Automation descuenta el stock del consumible."),
+        ("Referencia", "La fila 2 contiene un ejemplo listo para copiar o reemplazar."),
+    ]
+    ws_help.column_dimensions["A"].width = 22
+    ws_help.column_dimensions["B"].width = 98
+    for row_idx, (title, detail) in enumerate(instructions, start=1):
+        title_cell = ws_help.cell(row=row_idx, column=1, value=title)
+        title_cell.font = Font(bold=True)
+        detail_cell = ws_help.cell(row=row_idx, column=2, value=detail)
+        detail_cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out.getvalue()
+
+
+def build_consumibles_assignment_payload(config: AppConfig, row: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
+    """Arma el payload para crear una asignación de consumibles (typeId 230)."""
+    row_lookup = build_row_lookup(row)
+    raw_name = get_row_value_by_aliases(row_lookup, CONSUMIBLES_COLUMN_ALIASES["name"])
+    raw_user = get_row_value_by_aliases(row_lookup, CONSUMIBLES_COLUMN_ALIASES["user"])
+    raw_consumible = get_row_value_by_aliases(row_lookup, CONSUMIBLES_COLUMN_ALIASES["consumible"])
+    raw_quantity = get_row_value_by_aliases(row_lookup, CONSUMIBLES_COLUMN_ALIASES["quantity"])
+    raw_date = get_row_value_by_aliases(row_lookup, CONSUMIBLES_COLUMN_ALIASES["assignment_date"])
+    raw_ticket = get_row_value_by_aliases(row_lookup, CONSUMIBLES_COLUMN_ALIASES["ticket"])
+
+    details = {
+        "name": raw_name,
+        "user": raw_user,
+        "consumible": raw_consumible,
+        "quantity": raw_quantity,
+        "ticket": raw_ticket,
+    }
+    issues: list[str] = []
+
+    if not raw_user:
+        issues.append("Falta Usuario asignado (1062).")
+    if not raw_consumible:
+        issues.append("Falta Consumibles (1063).")
+    if not raw_quantity:
+        issues.append("Falta Cantidad (1064).")
+    if issues:
+        return [], issues, details
+
+    auth, headers = build_auth_headers(config)
+    account_id = resolve_user_account_id(config, raw_user, auth)
+    if not account_id:
+        issues.append(f"No se encontró el usuario `{raw_user}` en Jira.")
+
+    consumible_key = resolve_reference_object_key(
+        config,
+        CONSUMIBLES_OBJECT_TYPE_ID,
+        raw_consumible,
+        auth,
+        attr_id=ID_CONSUMIBLES_ASSIGNMENT_CONSUMIBLE,
+        headers=headers,
+    )
+    if not consumible_key:
+        issues.append(f"No pude resolver el consumible `{raw_consumible}` en Assets.")
+
+    quantity_value = normalize_tabular_value(raw_quantity)
+    quantity: int | None = None
+    try:
+        quantity = int(float(quantity_value.replace(",", ".")))
+    except (AttributeError, ValueError):
+        issues.append(f"Cantidad inválida `{raw_quantity}`.")
+    if quantity is None or quantity <= 0:
+        issues.append("La cantidad debe ser mayor a cero.")
+
+    assignment_name = raw_name or f"{raw_user} - {raw_consumible} x{quantity or raw_quantity}"
+    details["name"] = assignment_name
+    details["quantity"] = quantity if quantity is not None else raw_quantity
+    details["consumible_key"] = consumible_key or ""
+
+    if issues:
+        return [], issues, details
+
+    attrs = [
+        {"objectTypeAttributeId": ID_CONSUMIBLES_ASSIGNMENT_NAME, "objectAttributeValues": [{"value": assignment_name}]},
+        {"objectTypeAttributeId": ID_CONSUMIBLES_ASSIGNMENT_USER, "objectAttributeValues": [{"value": account_id}]},
+        {"objectTypeAttributeId": ID_CONSUMIBLES_ASSIGNMENT_CONSUMIBLE, "objectAttributeValues": [{"value": consumible_key}]},
+        {"objectTypeAttributeId": ID_CONSUMIBLES_ASSIGNMENT_QTY, "objectAttributeValues": [{"value": quantity}]},
+    ]
+    if raw_date:
+        parsed_date = parse_date(raw_date)
+        attrs.append(
+            {
+                "objectTypeAttributeId": ID_CONSUMIBLES_ASSIGNMENT_DATE,
+                "objectAttributeValues": [{"value": parsed_date.strftime("%Y-%m-%d") if parsed_date else raw_date}],
+            }
+        )
+    if raw_ticket:
+        attrs.append({"objectTypeAttributeId": ID_CONSUMIBLES_ASSIGNMENT_TICKET, "objectAttributeValues": [{"value": raw_ticket}]})
+    return attrs, [], details
+
+
 def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]]) -> None:
     """Renderiza la página de scripts: carga, modificación y reglas de normalización."""
     st.subheader("Scripts")
-    tab_config, tab1, tab2, tab3, tab4 = st.tabs(["⚙️ Configuración", "📥 Carga masiva", "✏️ Modificación masiva", "⚙️ Reglas de normalización", "🤖 Asignación automática"])
+    tab_config, tab1, tab2, tab3, tab4, tab5 = st.tabs(["⚙️ Configuración", "📥 Carga masiva", "✏️ Modificación masiva", "📦 Consumibles", "⚙️ Reglas de normalización", "🤖 Asignación automática"])
     with tab_config:
         st.markdown("**Opciones generales**")
         c1, c2 = st.columns(2)
@@ -6658,6 +6842,63 @@ def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]]) -> None
                     progress.progress(min((idx + 1) / max(total_rows, 1), 1.0))
                 st.dataframe(results, use_container_width=True, hide_index=True)
     with tab3:
+        if Workbook is not None:
+            st.download_button(
+                "📥 Descargar plantilla de consumibles",
+                data=build_consumibles_template_bytes(),
+                file_name="plantilla_carga_masiva_consumibles.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_consumibles_template",
+            )
+            st.caption("Creá una fila por asignación. La app genera un objeto en Asignaciones (230) y Jira descuenta el stock del consumible.")
+        uploaded_consumibles = st.file_uploader("Subir Excel para asignaciones de consumibles", type=["xlsx", "xls"], key="mass_consumibles")
+        if uploaded_consumibles is not None and pd is not None:
+            frame_consumibles = pd.read_excel(uploaded_consumibles).fillna("")
+            st.dataframe(frame_consumibles.head(10), use_container_width=True, hide_index=True)
+            if st.button("📦 Ejecutar asignaciones de consumibles", key="run_mass_consumibles"):
+                progress = st.progress(0)
+                results = []
+                total_rows = len(frame_consumibles)
+                for idx, row in frame_consumibles.iterrows():
+                    row_dict = row.to_dict()
+                    if is_consumibles_example_row(row_dict):
+                        results.append({"fila": idx + 1, "ok": True, "detalle": "Fila de ejemplo omitida", "consumible": ""})
+                        progress.progress(min((idx + 1) / max(total_rows, 1), 1.0))
+                        continue
+                    attrs, issues, details = build_consumibles_assignment_payload(config, row_dict)
+                    if issues:
+                        ok, msg = False, " | ".join(issues[:3])
+                    elif attrs:
+                        ok, msg = create_asset_from_payload(config, CONSUMIBLES_ASSIGNMENT_TYPE_ID, attrs)
+                    else:
+                        ok, msg = False, "Sin atributos válidos para crear la asignación"
+                    if ok:
+                        log_movimiento(
+                            config,
+                            None,
+                            "CONSUMIBLES_MASIVO",
+                            "consumible",
+                            "",
+                            str(details.get("consumible") or details.get("consumible_key") or ""),
+                            "OK",
+                            msg,
+                            str(details.get("name") or ""),
+                        )
+                    results.append(
+                        {
+                            "fila": idx + 1,
+                            "ok": ok,
+                            "detalle": msg,
+                            "consumible": str(details.get("consumible") or ""),
+                            "usuario": str(details.get("user") or ""),
+                            "cantidad": str(details.get("quantity") or ""),
+                        }
+                    )
+                    progress.progress(min((idx + 1) / max(total_rows, 1), 1.0))
+                st.dataframe(results, use_container_width=True, hide_index=True)
+                if st.button("Refrescar inventario", key="refresh_after_consumibles"):
+                    refresh_assets(config, st.session_state.aql_input, force_live=True)
+    with tab4:
         campos_base = ["hostname", "serial_number", "model", "status", "country", "company", "provider", "entity"]
         campo_cond = st.selectbox("Campo condición", campos_base + ["Atributo personalizado..."], key="rule_cond_field")
         if campo_cond == "Atributo personalizado...":
@@ -6709,7 +6950,7 @@ def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]]) -> None
                 st.session_state["reglas_guardadas"] = [r for i, r in enumerate(reglas) if i != idx]
                 if not save_normalization_rules(st.session_state["reglas_guardadas"]):
                     st.error("No se pudo persistir la eliminación de la regla.")
-    with tab4:
+    with tab5:
         scheduler_enabled = st.toggle(
             "Activar scheduler automático",
             value=bool(st.session_state.get("scheduler_running", False)),
