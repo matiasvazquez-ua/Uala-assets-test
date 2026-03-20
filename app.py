@@ -723,29 +723,27 @@ def build_auth_headers(config: AppConfig) -> tuple[BasicAuth, dict[str, str]]:
 
 
 def config_to_cache_key(config: AppConfig) -> dict[str, str]:
-    """Genera clave serializable del config para operaciones auxiliares."""
+    """Genera snapshot serializable sin secretos para operaciones auxiliares."""
     return {
         "jira_email": config.jira_email,
-        "jira_api_token": config.jira_api_token,
         "workspace_id": config.workspace_id,
         "site": config.site,
-        "openai_api_key": config.openai_api_key,
         "openai_model": config.openai_model,
-        "rovo_api_key": config.rovo_api_key,
         "rovo_enabled": "true" if config.rovo_enabled else "false",
     }
 
 
 def config_from_cache_key(data: dict[str, str]) -> AppConfig:
-    """Reconstruye AppConfig desde una clave serializable."""
+    """Reconstruye AppConfig combinando snapshot no sensible con secretos frescos."""
+    base_config = load_config()
     return AppConfig(
-        jira_email=str(data.get("jira_email") or ""),
-        jira_api_token=str(data.get("jira_api_token") or ""),
-        workspace_id=str(data.get("workspace_id") or ""),
-        site=str(data.get("site") or ""),
-        openai_api_key=str(data.get("openai_api_key") or ""),
-        openai_model=str(data.get("openai_model") or "gpt-4o-mini"),
-        rovo_api_key=str(data.get("rovo_api_key") or ""),
+        jira_email=str(data.get("jira_email") or base_config.jira_email or ""),
+        jira_api_token=base_config.jira_api_token,
+        workspace_id=str(data.get("workspace_id") or base_config.workspace_id or ""),
+        site=str(data.get("site") or base_config.site or ""),
+        openai_api_key=base_config.openai_api_key,
+        openai_model=str(data.get("openai_model") or base_config.openai_model or "gpt-4o-mini"),
+        rovo_api_key=base_config.rovo_api_key,
         rovo_enabled=str(data.get("rovo_enabled") or "").strip().lower() in {"1", "true", "yes", "si", "sí"},
     )
 
