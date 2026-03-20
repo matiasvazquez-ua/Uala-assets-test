@@ -270,6 +270,73 @@ class TestScriptInputs(unittest.TestCase):
         self.assertEqual(attr_map[app.ID_ASIGNACION], "matias.vazquez@gmail.com")
         resolve_user_mock.assert_not_called()
 
+    def test_resolve_reference_object_key_matches_email_inside_label(self) -> None:
+        config = app.AppConfig(
+            jira_email="jira@example.com",
+            jira_api_token="token",
+            workspace_id="workspace",
+            site="https://bancar.atlassian.net",
+            openai_api_key="",
+            openai_model="gpt-4o-mini",
+            rovo_api_key="",
+            rovo_enabled=False,
+        )
+        lookup = {
+            app.normalize_lookup_key("Matias Vazquez (matias.vazquez@gmail.com)"): "USR-1",
+        }
+        with mock.patch.object(app, "fetch_reference_object_lookup", return_value=lookup):
+            resolved = app.resolve_reference_object_key(
+                config,
+                "1232-ref",
+                "matias.vazquez@gmail.com",
+                _auth := mock.Mock(),
+                attr_id=app.ID_ASIGNACION,
+                headers={},
+            )
+        self.assertEqual(resolved, "USR-1")
+
+    def test_warranty_date_is_sent_as_jira_datetime(self) -> None:
+        config = app.AppConfig(
+            jira_email="jira@example.com",
+            jira_api_token="token",
+            workspace_id="workspace",
+            site="https://bancar.atlassian.net",
+            openai_api_key="",
+            openai_model="gpt-4o-mini",
+            rovo_api_key="",
+            rovo_enabled=False,
+        )
+        row = {
+            "Nombre del activo": "NB-04",
+            "Hostname": "NB-04",
+            "Serial Number": "SER-004",
+            "Tipo de activo": "laptops",
+            "Fecha garantía": "2027-03-20",
+        }
+        attr_defs = [
+            {"id": app.ID_NAME, "name": "Name", "defaultType": {"name": "Text"}},
+            {"id": app.ID_HOSTNAME, "name": "Hostname", "defaultType": {"name": "Text"}},
+            {"id": app.ID_SERIAL, "name": "Serial Number", "defaultType": {"name": "Text"}},
+            {"id": app.ID_CATEGORIA, "name": "Categoria", "referenceObjectType": {"id": "1300-ref"}},
+            {"id": app.ID_FECHA_GARANTIA, "name": "Fecha soporte garantia", "defaultType": {"name": "DateTime"}},
+        ]
+
+        def fake_ref_resolver(_config, reference_type_id, raw_value, _auth, *, attr_id="", headers=None):
+            if reference_type_id == "1300-ref":
+                return "CAT-1"
+            return None
+
+        with (
+            mock.patch.object(app, "fetch_object_type_attributes", return_value=attr_defs),
+            mock.patch.object(app, "resolve_reference_object_key", side_effect=fake_ref_resolver),
+            mock.patch.object(app, "fetch_attribute_option_lookup", return_value={}),
+        ):
+            _, attrs, issues = app.build_asset_create_payload(config, row)
+
+        attr_map = self._attr_map(attrs)
+        self.assertEqual(issues, [])
+        self.assertEqual(attr_map[app.ID_FECHA_GARANTIA], "2027-03-20T00:00:00.000Z")
+
     def test_create_asset_from_payload_returns_real_error_body(self) -> None:
         config = app.AppConfig(
             jira_email="jira@example.com",

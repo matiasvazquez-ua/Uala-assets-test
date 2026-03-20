@@ -456,6 +456,10 @@ def canonical_model_key(value: Any) -> str:
     return text.rstrip(" /")
 
 
+def compact_lookup_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", normalize_lookup_key(value))
+
+
 def lookup_tokens(value: Any) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", normalize_lookup_key(value)))
 
@@ -537,6 +541,13 @@ def parse_date(value: str) -> datetime | None:
         except ValueError:
             continue
     return None
+
+
+def format_jira_datetime(value: str) -> str:
+    parsed = parse_date(value)
+    if parsed is None:
+        return str(value or "").strip()
+    return parsed.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
 def canonical_category(raw_value: str) -> str:
@@ -1685,7 +1696,7 @@ def fetch_reference_object_lookup(
                     headers=headers,
                     json_payload={
                         "qlQuery": f"objectTypeId = {cache_key}",
-                        "includeAttributes": False,
+                        "includeAttributes": True,
                         "maxResults": 200,
                         "startAt": start_at,
                     },
@@ -1707,6 +1718,17 @@ def fetch_reference_object_lookup(
                     lookup[normalize_lookup_key(object_key)] = object_key
                 if label and object_key:
                     lookup[normalize_lookup_key(label)] = object_key
+                    compact_label = compact_lookup_key(label)
+                    if compact_label:
+                        lookup[compact_label] = object_key
+                for attribute in item.get("attributes", []) or []:
+                    attr_value = extract_attr_text(attribute)
+                    if not attr_value or not object_key:
+                        continue
+                    lookup[normalize_lookup_key(attr_value)] = object_key
+                    compact_attr = compact_lookup_key(attr_value)
+                    if compact_attr:
+                        lookup[compact_attr] = object_key
 
             if len(values) < 200:
                 break
@@ -1807,6 +1829,9 @@ def resolve_reference_object_key(
         normalized = normalize_lookup_key(candidate)
         if normalized and normalized in lookup:
             return lookup[normalized]
+        compact = compact_lookup_key(candidate)
+        if compact and compact in lookup:
+            return lookup[compact]
 
     if attr_id == ID_MODELO:
         target_key = canonical_model_key(raw)
@@ -1816,9 +1841,14 @@ def resolve_reference_object_key(
                     return object_key
 
     normalized_raw = normalize_lookup_key(raw)
+    compact_raw = compact_lookup_key(raw)
     for key, object_key in lookup.items():
         if normalized_raw and (normalized_raw in key or key in normalized_raw):
             return object_key
+        if compact_raw:
+            compact_key = compact_lookup_key(key)
+            if compact_key and (compact_raw in compact_key or compact_key in compact_raw):
+                return object_key
     return None
 
 
@@ -1847,9 +1877,11 @@ def resolve_mass_upload_attribute_value(
         value = normalize_company(raw)
     elif attr_id == ID_COSTO:
         return parse_cost(raw), ""
-    elif attr_id in {ID_FECHA_COMPRA, ID_FECHA_GARANTIA}:
+    elif attr_id == ID_FECHA_COMPRA:
         parsed_date = parse_date(raw)
         return (parsed_date.strftime("%Y-%m-%d") if parsed_date else raw), ""
+    elif attr_id == ID_FECHA_GARANTIA:
+        return format_jira_datetime(raw), ""
 
     if reference_object_type_id:
         resolved = resolve_reference_object_key(
