@@ -30,6 +30,11 @@ class TestPromptParsing(unittest.TestCase):
         filters = app.parse_filters_from_prompt("comparar stock entre países")
         self.assertEqual(filters, {})
 
+    def test_email_only_prompt_maps_to_assignee_without_identifier(self) -> None:
+        filters = app.parse_filters_from_prompt("matias.vazquez2024@gmail.com")
+        self.assertEqual(filters.get("assignee"), "matias.vazquez2024@gmail.com")
+        self.assertNotIn("identifier", filters)
+
     def test_bulk_update_accepts_natural_phrase(self) -> None:
         parsed = app.parse_bulk_location_action("actualizá en lote ISI-31645 ISI-32067 a México Bancar MEX")
         self.assertEqual(parsed, (["ISI-31645", "ISI-32067"], "Bancar MEX", "México"))
@@ -107,6 +112,44 @@ class TestScriptInputs(unittest.TestCase):
         self.assertEqual(attr_map[app.ID_PAIS], "Colombia")
         self.assertEqual(attr_map[app.ID_COMPANIA], "Bancar COL")
 
+    def test_answer_inventory_question_returns_assets_for_email_query(self) -> None:
+        assets = [
+            {
+                "jira_key": "ISI-1",
+                "name": "NB-01",
+                "hostname": "NB-01",
+                "serial_number": "SER-001",
+                "status": "En uso",
+                "country": "Argentina",
+                "assigned_to": "matias.vazquez2024@gmail.com",
+            },
+            {
+                "jira_key": "ISI-2",
+                "name": "NB-02",
+                "hostname": "NB-02",
+                "serial_number": "SER-002",
+                "status": "En uso",
+                "country": "Argentina",
+                "assigned_to": "matias.vazquez2024@gmail.com",
+            },
+            {
+                "jira_key": "ISI-3",
+                "name": "NB-03",
+                "hostname": "NB-03",
+                "serial_number": "SER-003",
+                "status": "Stock nuevo",
+                "country": "Argentina",
+                "assigned_to": "otra.persona@bancar.com",
+            },
+        ]
+
+        response = app.answer_inventory_question(assets, "matias.vazquez2024@gmail.com")
+
+        self.assertIn("activos asignados a **matias.vazquez2024@gmail.com**", response)
+        self.assertIn("SER-001", response)
+        self.assertIn("SER-002", response)
+        self.assertNotIn("SER-003", response)
+
     def test_mass_update_identifier_accepts_serial_aliases(self) -> None:
         self.assertEqual(app.resolve_mass_update_identifier({"Serial": "SER-001"}), "SER-001")
         self.assertEqual(app.resolve_mass_update_identifier({"Número de serie": "SER-002"}), "SER-002")
@@ -126,6 +169,19 @@ class TestScriptInputs(unittest.TestCase):
         self.assertEqual(headers, app.MASS_UPLOAD_TEMPLATE_HEADERS)
         self.assertEqual(ws["A2"].value, app.MASS_UPLOAD_TEMPLATE_EXAMPLE_ROW["Tipo de activo"])
         self.assertEqual(ws["G2"].value, app.MASS_UPLOAD_TEMPLATE_EXAMPLE_ROW["País"])
+        self.assertEqual(workbook["Listas"].sheet_state, "hidden")
+
+    def test_mass_update_template_contains_expected_sheets_and_headers(self) -> None:
+        raw = app.build_mass_update_template_bytes()
+        workbook = load_workbook(io.BytesIO(raw))
+
+        self.assertEqual(workbook.sheetnames, ["Modificación masiva", "Listas", "Instrucciones"])
+        ws = workbook["Modificación masiva"]
+        headers = [ws.cell(row=1, column=idx).value for idx in range(1, len(app.MASS_UPDATE_TEMPLATE_HEADERS) + 1)]
+
+        self.assertEqual(headers, app.MASS_UPDATE_TEMPLATE_HEADERS)
+        self.assertEqual(ws["A2"].value, app.MASS_UPDATE_TEMPLATE_EXAMPLE_ROW["Serial Number"])
+        self.assertEqual(ws["E2"].value, app.MASS_UPDATE_TEMPLATE_EXAMPLE_ROW["Estado del activo"])
         self.assertEqual(workbook["Listas"].sheet_state, "hidden")
 
     def test_build_asset_create_payload_resolves_special_attribute_types(self) -> None:
@@ -393,6 +449,12 @@ class TestScriptInputs(unittest.TestCase):
         altered = dict(app.MASS_UPLOAD_TEMPLATE_EXAMPLE_ROW)
         altered["Serial Number"] = "OTRO-SERIAL"
         self.assertFalse(app.is_mass_upload_example_row(altered))
+
+    def test_detects_mass_update_template_example_row(self) -> None:
+        self.assertTrue(app.is_mass_update_example_row(dict(app.MASS_UPDATE_TEMPLATE_EXAMPLE_ROW)))
+        altered = dict(app.MASS_UPDATE_TEMPLATE_EXAMPLE_ROW)
+        altered["Estado del activo"] = "Stock usado"
+        self.assertFalse(app.is_mass_update_example_row(altered))
 
     def test_resolve_reference_object_key_matches_email_inside_label(self) -> None:
         config = app.AppConfig(

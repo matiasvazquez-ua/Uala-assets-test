@@ -315,6 +315,41 @@ MASS_UPLOAD_TEMPLATE_LISTS = {
     "País": ["Argentina", "Colombia", "México"],
     "Compañía": ["Bancar ARG", "Bancar COL", "Bancar MEX"],
 }
+MASS_UPDATE_TEMPLATE_HEADERS = [
+    "Serial Number",
+    "Nombre del activo",
+    "Hostname",
+    "Nombre del modelo",
+    "Estado del activo",
+    "País",
+    "Compañía",
+    "Entidad del activo",
+    "Usuario asignado",
+    "Fecha de compra",
+    "Fecha garantía",
+    "Purchase Price",
+    "Provider",
+    "Tipo de activo",
+]
+MASS_UPDATE_REQUIRED_HEADERS = ["Serial Number"]
+MASS_UPDATE_REQUIRED_HEADER_SET = set(MASS_UPDATE_REQUIRED_HEADERS)
+MASS_UPDATE_TEMPLATE_EXAMPLE_ROW = {
+    "Serial Number": "ABC123XYZ",
+    "Nombre del activo": "",
+    "Hostname": "WKSAR0001L-RENOMBRADA",
+    "Nombre del modelo": "",
+    "Estado del activo": "En uso",
+    "País": "Argentina",
+    "Compañía": "Bancar ARG",
+    "Entidad del activo": "",
+    "Usuario asignado": "nombre.apellido@bancar.com",
+    "Fecha de compra": "",
+    "Fecha garantía": "",
+    "Purchase Price": "",
+    "Provider": "Macstation",
+    "Tipo de activo": "",
+}
+MASS_UPDATE_TEMPLATE_LISTS = MASS_UPLOAD_TEMPLATE_LISTS
 MASS_UPDATE_IDENTIFIER_ALIASES = [
     "Serial",
     "Serial Number",
@@ -2140,6 +2175,9 @@ def parse_status_change_action(prompt: str) -> tuple[str, str] | None:
 
 def parse_assignee_query(prompt: str) -> str | None:
     text = (prompt or "").strip()
+    direct_email = extract_email_query(text)
+    if direct_email and normalize_text(text) == normalize_text(direct_email):
+        return direct_email
     patterns = [
         r"(?:que|qué)\s+tiene\s+asignad[oa]\s+(.+)$",
         r"asignad[oa]s?\s+a\s+(.+)$",
@@ -2164,6 +2202,11 @@ def parse_assignee_of_identifier_query(prompt: str) -> str | None:
         if m:
             return m.group(1).strip(" ?.")
     return None
+
+
+def extract_email_query(prompt: str) -> str | None:
+    match = re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", prompt or "")
+    return match.group(0).strip() if match else None
 
 
 def looks_like_inventory_identifier(token: str) -> bool:
@@ -3759,7 +3802,12 @@ def parse_filters_from_prompt(prompt: str) -> dict[str, str]:
     company = detect_company_from_prompt(prompt)
     entity = detect_entity_from_prompt(prompt)
     person = parse_assignee_query(prompt)
-    identifier_context = any(x in t for x in ["serial", "sn", "equipo", "hostname", "host", "jira", "key"]) or bool(parse_assignee_of_identifier_query(prompt)) or len(t.split()) <= 3
+    email_query = extract_email_query(prompt)
+    identifier_context = (
+        any(x in t for x in ["serial", "sn", "equipo", "hostname", "host", "jira", "key"])
+        or bool(parse_assignee_of_identifier_query(prompt))
+        or len(t.split()) <= 3
+    ) and not email_query
     serial = extract_serial_candidate(prompt) if identifier_context else None
     if not serial:
         # Caso común: el usuario escribe solo el identificador (serial/hostname/key).
@@ -3793,9 +3841,9 @@ def parse_filters_from_prompt(prompt: str) -> dict[str, str]:
         f["assignee"] = person
     if serial:
         f["identifier"] = serial
-    mail = re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", prompt or "")
-    if mail:
-        f["assignee"] = mail.group(0)
+    if email_query:
+        f["assignee"] = email_query
+        f.pop("identifier", None)
     model = re.search(r"(?:modelo|model)\s+(.+)$", prompt, flags=re.IGNORECASE)
     if model and not attribute_search:
         f["model"] = model.group(1).strip().strip("\"'")
@@ -4400,9 +4448,9 @@ def answer_inventory_question(assets: list[dict[str, Any]], prompt: str) -> str:
     if parse_nl_dashboard_request(prompt):
         return build_dashboard_chat_payload(assets, prompt)
     filters = parse_filters_from_prompt(prompt)
-    mail_match = re.search(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", prompt)
-    if mail_match and not filters.get("assignee"):
-        filters["assignee"] = mail_match.group(0)
+    email_query = extract_email_query(prompt)
+    if email_query and not filters.get("assignee"):
+        filters["assignee"] = email_query
     selected = list(apply_filters(assets, filters)) if filters else list(assets)
 
     def _owner_by_identifier() -> str | None:
@@ -4419,10 +4467,11 @@ def answer_inventory_question(assets: list[dict[str, Any]], prompt: str) -> str:
             return None
         if not selected:
             return "ℹ️ No encontré activos asignados para ese usuario."
-        lines = [f"ℹ️ Encontré **{len(selected)}** activos del usuario:"]
+        lines = [f"ℹ️ Encontré **{len(selected)}** activos asignados a **{filters['assignee']}**:"]
         for asset in selected[:40]:
             lines.append(
-                f"- **{asset.get('jira_key') or asset.get('name')}** | {asset.get('hostname') or 'Sin hostname'} | {asset.get('status')} | {asset.get('country')}"
+                f"- **{asset.get('jira_key') or asset.get('name')}** | Hostname: {get_hostname_value(asset) or 'N/A'} | "
+                f"Serial: {get_serial_value(asset) or 'N/A'} | Estado: {asset.get('status')} | País: {asset.get('country')}"
             )
         return "\n".join(lines)
 
@@ -6302,6 +6351,90 @@ def build_mass_upload_template_bytes() -> bytes:
     return out.getvalue()
 
 
+def is_mass_update_example_row(row: dict[str, Any]) -> bool:
+    """Detecta la fila de ejemplo incluida en la plantilla de modificación."""
+    row_lookup = build_row_lookup(row)
+    for header, expected in MASS_UPDATE_TEMPLATE_EXAMPLE_ROW.items():
+        actual = get_row_value_by_aliases(row_lookup, [header])
+        if normalize_tabular_value(actual) != normalize_tabular_value(expected):
+            return False
+    return True
+
+
+def build_mass_update_template_bytes() -> bytes:
+    """Genera una plantilla Excel para modificaciones masivas de assets."""
+    if Workbook is None or Font is None or PatternFill is None or Alignment is None or get_column_letter is None:
+        raise RuntimeError("openpyxl no está disponible para generar la plantilla.")
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Modificación masiva"
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(MASS_UPDATE_TEMPLATE_HEADERS))}2"
+
+    header_fill = PatternFill(start_color="003262", end_color="003262", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+    required_fill = PatternFill(start_color="D4A12A", end_color="D4A12A", fill_type="solid")
+    example_fill = PatternFill(start_color="F6F8FC", end_color="F6F8FC", fill_type="solid")
+
+    for col_idx, header in enumerate(MASS_UPDATE_TEMPLATE_HEADERS, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.font = header_font
+        cell.fill = required_fill if header in MASS_UPDATE_REQUIRED_HEADER_SET else header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        example_value = MASS_UPDATE_TEMPLATE_EXAMPLE_ROW.get(header, "")
+        example_cell = ws.cell(row=2, column=col_idx, value=example_value)
+        example_cell.fill = example_fill
+        example_cell.alignment = Alignment(vertical="center")
+
+    for col_idx, header in enumerate(MASS_UPDATE_TEMPLATE_HEADERS, start=1):
+        values = [header]
+        if header in MASS_UPDATE_REQUIRED_HEADER_SET:
+            values[0] = f"{header} *"
+        max_len = max(len(str(item or "")) for item in values + [MASS_UPDATE_TEMPLATE_EXAMPLE_ROW.get(header, "")])
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len + 4, 18), 34)
+
+    ws_lists = wb.create_sheet("Listas")
+    ws_lists.sheet_state = "hidden"
+    for col_idx, (header, values) in enumerate(MASS_UPDATE_TEMPLATE_LISTS.items(), start=1):
+        ws_lists.cell(row=1, column=col_idx, value=header)
+        for row_idx, value in enumerate(values, start=2):
+            ws_lists.cell(row=row_idx, column=col_idx, value=value)
+        if DataValidation is not None and header in MASS_UPDATE_TEMPLATE_HEADERS:
+            col_letter = get_column_letter(col_idx)
+            dv = DataValidation(
+                type="list",
+                formula1=f"=Listas!${col_letter}$2:${col_letter}${len(values) + 1}",
+                allow_blank=True,
+            )
+            ws.add_data_validation(dv)
+            target_col = MASS_UPDATE_TEMPLATE_HEADERS.index(header) + 1
+            dv.add(f"{get_column_letter(target_col)}2:{get_column_letter(target_col)}1000")
+
+    ws_help = wb.create_sheet("Instrucciones")
+    instructions = [
+        ("Objetivo", "Informar el Serial Number del asset y completar solo las columnas que querés modificar antes de subir el archivo desde Scripts > Modificación masiva."),
+        ("Campo obligatorio", "Serial Number."),
+        ("Identificación", "La app busca el asset por serial exacto dentro del inventario actual."),
+        ("Campos vacíos", "Toda columna vacía se ignora y no modifica el valor existente."),
+        ("Fechas", "Usar formato YYYY-MM-DD."),
+        ("Referencia", "La fila 2 contiene un ejemplo y la app la omite automáticamente si se sube sin cambios."),
+    ]
+    ws_help.column_dimensions["A"].width = 22
+    ws_help.column_dimensions["B"].width = 96
+    for row_idx, (title, detail) in enumerate(instructions, start=1):
+        title_cell = ws_help.cell(row=row_idx, column=1, value=title)
+        title_cell.font = Font(bold=True)
+        detail_cell = ws_help.cell(row=row_idx, column=2, value=detail)
+        detail_cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out.getvalue()
+
+
 def resolve_mass_update_identifier(row: dict[str, Any]) -> str:
     row_lookup = build_row_lookup(row)
     return get_row_value_by_aliases(row_lookup, MASS_UPLOAD_COLUMN_ALIASES["serial"])
@@ -6380,6 +6513,15 @@ def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]]) -> None
                 if st.button("Refrescar inventario", key="refresh_after_load"):
                     refresh_assets(config, st.session_state.aql_input, force_live=True)
     with tab2:
+        if Workbook is not None:
+            st.download_button(
+                "📥 Descargar plantilla de modificación",
+                data=build_mass_update_template_bytes(),
+                file_name="plantilla_modificacion_assets.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_mass_update_template",
+            )
+            st.caption("Completá el Serial Number y solo las columnas que querés actualizar. La fila de ejemplo se omite automáticamente.")
         uploaded_mod = st.file_uploader("Subir Excel para modificación masiva", type=["xlsx", "xls"], key="mass_update")
         if uploaded_mod is not None and pd is not None:
             frame_mod = pd.read_excel(uploaded_mod).fillna("")
@@ -6392,6 +6534,10 @@ def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]]) -> None
                 seen_serials: dict[str, int] = {}
                 for idx, row in frame_mod.iterrows():
                     row_dict = row.to_dict()
+                    if is_mass_update_example_row(row_dict):
+                        results.append({"fila": idx + 1, "identificador": "", "ok": True, "detalle": "Fila de ejemplo omitida"})
+                        progress.progress(min((idx + 1) / max(total_rows, 1), 1.0))
+                        continue
                     identifier = resolve_mass_update_identifier(row_dict)
                     if not identifier:
                         results.append({"fila": idx + 1, "identificador": "", "ok": False, "detalle": "Falta Serial Number"})
