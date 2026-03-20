@@ -518,6 +518,58 @@ class TestScriptInputs(unittest.TestCase):
 
         self.assertEqual(lookup[app.normalize_lookup_key("matias.vazquez@gmail.com")], "USR-1")
 
+    def test_fetch_reference_object_lookup_merges_aliases_from_later_endpoints(self) -> None:
+        config = app.AppConfig(
+            jira_email="jira@example.com",
+            jira_api_token="token",
+            workspace_id="workspace",
+            site="https://bancar.atlassian.net",
+            openai_api_key="",
+            openai_model="gpt-4o-mini",
+            rovo_api_key="",
+            rovo_enabled=False,
+        )
+        first_response = mock.Mock()
+        first_response.json.return_value = {
+            "values": [
+                {
+                    "objectKey": "USR-1",
+                    "label": "Matias Vazquez",
+                    "attributes": [],
+                }
+            ]
+        }
+        second_response = mock.Mock()
+        second_response.json.return_value = {
+            "values": [
+                {
+                    "objectKey": "USR-1",
+                    "label": "Matias Vazquez",
+                    "attributes": [
+                        {
+                            "objectAttributeValues": [
+                                {
+                                    "displayValue": "Matias Vazquez",
+                                    "value": "matias.vazquez@uala.com.ar",
+                                }
+                            ]
+                        }
+                    ],
+                }
+            ]
+        }
+        third_response = mock.Mock()
+        third_response.json.return_value = {"values": []}
+        app.st.session_state.clear()
+        with mock.patch.object(
+            app,
+            "jira_request_with_retry",
+            side_effect=[first_response, second_response, third_response],
+        ):
+            lookup = app.fetch_reference_object_lookup(config, "1232-ref", mock.Mock(), {})
+
+        self.assertEqual(lookup[app.normalize_lookup_key("matias.vazquez@uala.com.ar")], "USR-1")
+
     def test_warranty_date_is_sent_as_jira_datetime(self) -> None:
         config = app.AppConfig(
             jira_email="jira@example.com",

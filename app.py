@@ -1801,9 +1801,6 @@ def fetch_reference_object_lookup(
                 break
             start_at += 200
 
-        if lookup:
-            break
-
     cache[cache_key] = dict(lookup)
     return lookup
 
