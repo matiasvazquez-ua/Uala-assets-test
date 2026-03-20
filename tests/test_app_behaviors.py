@@ -1,3 +1,4 @@
+import json
 import io
 import sys
 import unittest
@@ -46,6 +47,10 @@ class TestScriptInputs(unittest.TestCase):
             if values:
                 out[str(row.get("objectTypeAttributeId"))] = str(values[0].get("value", ""))
         return out
+
+    def tearDown(self) -> None:
+        app.st.session_state.clear()
+        app.clear_process_fetch_cache()
 
     def test_build_asset_payload_accepts_flexible_headers(self) -> None:
         row = {
@@ -216,6 +221,77 @@ class TestScriptInputs(unittest.TestCase):
         self.assertNotIn(app.ID_SERIAL, attr_map)
         self.assertEqual(attr_map[app.ID_HOSTNAME], "NB-01-NEW")
         self.assertEqual(attr_map[app.ID_ESTADO], "STATUS-2")
+
+    def test_cached_fetch_assets_prefers_live_empty_result_over_stale_snapshot(self) -> None:
+        config = app.AppConfig(
+            jira_email="jira@example.com",
+            jira_api_token="token",
+            workspace_id="workspace",
+            site="https://bancar.atlassian.net",
+            openai_api_key="",
+            openai_model="gpt-4o-mini",
+            rovo_api_key="",
+            rovo_enabled=False,
+        )
+        future = mock.Mock()
+        future.result.return_value = ([], {"last_base_records_count": 0}, [])
+        app.st.session_state.clear()
+        app.PROCESS_FETCH_RESULTS.clear()
+        app.PROCESS_FETCH_JOBS.clear()
+
+        with (
+            mock.patch.object(app.PROCESS_FETCH_EXECUTOR, "submit", return_value=future),
+            mock.patch.object(app, "load_assets_snapshot", return_value=([{"jira_key": "OLD-1"}], {"last_base_records_count": 1}, app.datetime.now())),
+            mock.patch.object(app, "save_assets_snapshot", return_value=True) as save_snapshot_mock,
+            mock.patch.object(app, "apply_fetch_metadata"),
+            mock.patch.object(app, "append_error_events"),
+        ):
+            assets = app.cached_fetch_assets(config, "", 10, force_live=False)
+
+        self.assertEqual(assets, [])
+        save_snapshot_mock.assert_called_once_with([], {"last_base_records_count": 0})
+        self.assertEqual(app.st.session_state.get("assets_source"), "live")
+
+    def test_cached_fetch_assets_uses_snapshot_only_when_live_fetch_fails(self) -> None:
+        config = app.AppConfig(
+            jira_email="jira@example.com",
+            jira_api_token="token",
+            workspace_id="workspace",
+            site="https://bancar.atlassian.net",
+            openai_api_key="",
+            openai_model="gpt-4o-mini",
+            rovo_api_key="",
+            rovo_enabled=False,
+        )
+        future = mock.Mock()
+        future.result.side_effect = RuntimeError("boom")
+        snapshot_time = app.datetime.now()
+        snapshot_assets = [{"jira_key": "OLD-1"}]
+        app.st.session_state.clear()
+        app.PROCESS_FETCH_RESULTS.clear()
+        app.PROCESS_FETCH_JOBS.clear()
+
+        with (
+            mock.patch.object(app.PROCESS_FETCH_EXECUTOR, "submit", return_value=future),
+            mock.patch.object(app, "load_assets_snapshot", return_value=(snapshot_assets, {"last_base_records_count": 1}, snapshot_time)),
+            mock.patch.object(app, "apply_fetch_metadata"),
+            mock.patch.object(app, "append_error_events"),
+            mock.patch.object(app, "save_assets_snapshot") as save_snapshot_mock,
+        ):
+            assets = app.cached_fetch_assets(config, "", 10, force_live=False)
+
+        self.assertEqual(assets, snapshot_assets)
+        save_snapshot_mock.assert_not_called()
+        self.assertEqual(app.st.session_state.get("assets_source"), "snapshot_fallback")
+
+    def test_clear_process_fetch_cache_empties_global_caches(self) -> None:
+        app.PROCESS_FETCH_RESULTS["hash-1"] = (0.0, [], {}, [])
+        app.PROCESS_FETCH_JOBS["hash-1"] = mock.Mock(cancel=mock.Mock())
+
+        app.clear_process_fetch_cache()
+
+        self.assertEqual(app.PROCESS_FETCH_RESULTS, {})
+        self.assertEqual(app.PROCESS_FETCH_JOBS, {})
 
     def test_build_asset_create_payload_creates_missing_model_and_skips_unknown_assignment(self) -> None:
         config = app.AppConfig(
@@ -453,16 +529,64 @@ class TestScriptInputs(unittest.TestCase):
 
 class TestChatDashboardIntegration(unittest.TestCase):
     def test_chat_renders_dashboard_section_below_history(self) -> None:
-        at = AppTest.from_file(str(APP_FILE), default_timeout=180)
-        at.query_params["page"] = "Chat"
-        at.run()
-        at.chat_input[0].set_value("mostrame gasto por país y calidad de datos para Bancar ARG").run()
+        snapshot_path = APP_DIR / "assets_snapshot.json"
+        previous_snapshot = snapshot_path.read_text(encoding="utf-8") if snapshot_path.exists() else None
+        sample_snapshot = {
+            "saved_at": "2026-03-20T10:00:00",
+            "assets": [
+                {
+                    "jira_key": "ISI-1",
+                    "name": "NB-01",
+                    "hostname": "NB-01",
+                    "serial_number": "SER-001",
+                    "category": "Portátiles",
+                    "status": "En uso",
+                    "country": "Argentina",
+                    "company": "Bancar ARG",
+                    "purchase_price": "1500",
+                    "warranty_date": "2027-03-20",
+                    "assigned_to": "ana@bancar.com",
+                    "attrs_by_name": {},
+                    "attrs_by_id": {},
+                },
+                {
+                    "jira_key": "ISI-2",
+                    "name": "NB-02",
+                    "hostname": "NB-02",
+                    "serial_number": "SER-002",
+                    "category": "Portátiles",
+                    "status": "Stock nuevo",
+                    "country": "Argentina",
+                    "company": "Bancar ARG",
+                    "purchase_price": "1800",
+                    "warranty_date": "2027-05-01",
+                    "assigned_to": "",
+                    "attrs_by_name": {},
+                    "attrs_by_id": {},
+                },
+            ],
+            "metadata": {"last_base_records_count": 2},
+        }
+        snapshot_path.write_text(json.dumps(sample_snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            at = AppTest.from_file(str(APP_FILE), default_timeout=180)
+            at.session_state["assets"] = sample_snapshot["assets"]
+            at.session_state["last_sync"] = None
+            at.session_state["assets_source"] = "snapshot_fallback"
+            at.query_params["page"] = "Chat"
+            at.run()
+            at.chat_input[0].set_value("mostrame gasto por país y calidad de datos para Bancar ARG").run()
 
-        markdown_values = [str(getattr(item, "value", "")) for item in at.markdown]
-        self.assertEqual(len(at.exception), 0)
-        self.assertGreaterEqual(len(at.chat_message), 2)
-        self.assertTrue(any("### Dashboard solicitado" in value for value in markdown_values))
-        self.assertGreaterEqual(sum("**Dashboard —" in value for value in markdown_values), 2)
+            markdown_values = [str(getattr(item, "value", "")) for item in at.markdown]
+            self.assertEqual(len(at.exception), 0)
+            self.assertGreaterEqual(len(at.chat_message), 2)
+            self.assertTrue(any("### Dashboard solicitado" in value for value in markdown_values))
+            self.assertGreaterEqual(sum("**Dashboard —" in value for value in markdown_values), 2)
+        finally:
+            if previous_snapshot is None:
+                snapshot_path.unlink(missing_ok=True)
+            else:
+                snapshot_path.write_text(previous_snapshot, encoding="utf-8")
 
 
 if __name__ == "__main__":

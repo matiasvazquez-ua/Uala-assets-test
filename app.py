@@ -2981,6 +2981,23 @@ def compute_cache_hash(config: AppConfig, aql_query: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def set_assets_source(source: str, *, synced_at: datetime | None = None) -> None:
+    st.session_state["assets_source"] = source
+    if isinstance(synced_at, datetime):
+        st.session_state["last_sync"] = synced_at
+
+
+def clear_process_fetch_cache() -> None:
+    with PROCESS_FETCH_LOCK:
+        for future in list(PROCESS_FETCH_JOBS.values()):
+            try:
+                future.cancel()
+            except Exception:
+                continue
+        PROCESS_FETCH_JOBS.clear()
+        PROCESS_FETCH_RESULTS.clear()
+
+
 def cached_fetch_assets(config: AppConfig, aql_query: str, ttl_minutes: int, *, force_live: bool = False) -> list[dict[str, Any]]:
     """Resuelve caché de assets con invalidación por hash y vencimiento."""
     discovered_snapshot = normalize_type_id_list(st.session_state.get("discovered_type_ids") or KNOWN_OBJECT_TYPE_IDS)
@@ -2996,6 +3013,7 @@ def cached_fetch_assets(config: AppConfig, aql_query: str, ttl_minutes: int, *, 
         and isinstance(expiry, datetime)
         and now < expiry
     ):
+        set_assets_source("session_cache")
         return st.session_state["assets"]
     process_now = time.time()
     with PROCESS_FETCH_LOCK:
@@ -3012,18 +3030,8 @@ def cached_fetch_assets(config: AppConfig, aql_query: str, ttl_minutes: int, *, 
             assets = copy.deepcopy(cached_assets)
             st.session_state["cache_hash"] = cache_hash
             st.session_state["cache_expiry"] = now + timedelta(minutes=ttl_minutes)
+            set_assets_source("process_cache")
             return assets
-
-    if not force_live:
-        snapshot_assets, snapshot_metadata, snapshot_saved_at = load_assets_snapshot()
-        if snapshot_assets:
-            debug_log(f"cached_fetch_assets:snapshot_hit count={len(snapshot_assets)} hash={cache_hash[:8]}")
-            apply_fetch_metadata({k: int(v or 0) for k, v in snapshot_metadata.items() if isinstance(v, (int, str))})
-            st.session_state["cache_hash"] = cache_hash
-            st.session_state["cache_expiry"] = now + timedelta(minutes=ttl_minutes)
-            if isinstance(snapshot_saved_at, datetime):
-                st.session_state["last_sync"] = snapshot_saved_at
-            return copy.deepcopy(snapshot_assets)
 
     with PROCESS_FETCH_LOCK:
         future = PROCESS_FETCH_JOBS.get(cache_hash)
@@ -3048,6 +3056,15 @@ def cached_fetch_assets(config: AppConfig, aql_query: str, ttl_minutes: int, *, 
             current_future = PROCESS_FETCH_JOBS.get(cache_hash)
             if current_future is future:
                 PROCESS_FETCH_JOBS.pop(cache_hash, None)
+        if not force_live:
+            snapshot_assets, snapshot_metadata, snapshot_saved_at = load_assets_snapshot()
+            if snapshot_assets or snapshot_metadata or isinstance(snapshot_saved_at, datetime):
+                debug_log(f"cached_fetch_assets:snapshot_fallback count={len(snapshot_assets)} hash={cache_hash[:8]}")
+                apply_fetch_metadata({k: int(v or 0) for k, v in snapshot_metadata.items() if isinstance(v, (int, str))})
+                st.session_state["cache_hash"] = cache_hash
+                st.session_state["cache_expiry"] = now + timedelta(minutes=ttl_minutes)
+                set_assets_source("snapshot_fallback", synced_at=snapshot_saved_at if isinstance(snapshot_saved_at, datetime) else None)
+                return copy.deepcopy(snapshot_assets)
         raise
 
     with PROCESS_FETCH_LOCK:
@@ -3063,10 +3080,10 @@ def cached_fetch_assets(config: AppConfig, aql_query: str, ttl_minutes: int, *, 
 
     apply_fetch_metadata(metadata)
     append_error_events(error_events)
-    if assets:
-        save_assets_snapshot(assets, metadata)
+    save_assets_snapshot(assets, metadata)
     st.session_state["cache_hash"] = cache_hash
     st.session_state["cache_expiry"] = now + timedelta(minutes=ttl_minutes)
+    set_assets_source("live", synced_at=now)
     return assets
 
 
@@ -4823,6 +4840,7 @@ def ensure_session_state() -> None:
     """Inicializa el estado de sesión de Streamlit."""
     st.session_state.setdefault("assets", [])
     st.session_state.setdefault("last_sync", None)
+    st.session_state.setdefault("assets_source", "none")
     st.session_state.setdefault("chat_history", [])
     st.session_state.setdefault("openai_history", [])
     st.session_state.setdefault("last_error", "")
@@ -4922,7 +4940,6 @@ def refresh_assets(config: AppConfig, aql_query: str = "", *, force_live: bool =
             aql_query,
             type_ids=get_active_hardware_type_ids(st.session_state.get("discovered_type_ids") or KNOWN_OBJECT_TYPE_IDS),
         )
-        st.session_state.last_sync = datetime.now()
         st.session_state.anomaly_report = run_anomaly_detection(st.session_state.assets)
         st.session_state.last_error = ""
     debug_log(
@@ -5176,6 +5193,14 @@ def render_topbar(config: AppConfig, current_page: str, assets: list[dict[str, A
     pages = ["Chat", "Activos", "Insights", "Auditoría", "Movimientos", "Scripts", "Extra"]
     last_sync = st.session_state.get("last_sync")
     sync_text = last_sync.strftime("%H:%M:%S") if last_sync else "sin sync"
+    source_raw = str(st.session_state.get("assets_source", "") or "").strip()
+    source_map = {
+        "live": "LIVE",
+        "session_cache": "CACHE",
+        "process_cache": "CACHE",
+        "snapshot_fallback": "SNAPSHOT",
+    }
+    source_text = source_map.get(source_raw, "SIN FUENTE")
     anomaly = st.session_state.get("anomaly_report", {})
     total_anomaly = int(anomaly.get("total", 0))
     garantia_vencida = int(anomaly.get("garantia_vencida_en_uso", 0))
@@ -5197,7 +5222,7 @@ def render_topbar(config: AppConfig, current_page: str, assets: list[dict[str, A
             </div>
             <div class="uala-topbar-right">
                 <div class="uala-alert-pill {alert_class}">{alert_label}{garantia_label}</div>
-                <div class="uala-sync-badge"><div class="uala-sync-dot {'' if last_sync else 'warn'}"></div>{sync_text}</div>
+                <div class="uala-sync-badge"><div class="uala-sync-dot {'' if last_sync else 'warn'}"></div>{sync_text} · {escape_html_text(source_text)}</div>
             </div>
         </div>
         """,
@@ -5256,6 +5281,7 @@ def render_filterbar(config: AppConfig) -> None:
         if col_ref.button("↻", help="Refrescar inventario", use_container_width=True):
             st.session_state.cache_hash = ""
             st.session_state.cache_expiry = None
+            clear_process_fetch_cache()
             refresh_assets(config, st.session_state.aql_input, force_live=True)
             st.rerun()
         if col_clr.button("✕", help="Limpiar filtros", use_container_width=True):
