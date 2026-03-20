@@ -518,7 +518,7 @@ class TestScriptInputs(unittest.TestCase):
 
         self.assertEqual(lookup[app.normalize_lookup_key("matias.vazquez@gmail.com")], "USR-1")
 
-    def test_fetch_reference_object_lookup_merges_aliases_from_later_endpoints(self) -> None:
+    def test_fetch_reference_object_lookup_falls_back_to_later_endpoint_when_first_is_empty(self) -> None:
         config = app.AppConfig(
             jira_email="jira@example.com",
             jira_api_token="token",
@@ -530,15 +530,7 @@ class TestScriptInputs(unittest.TestCase):
             rovo_enabled=False,
         )
         first_response = mock.Mock()
-        first_response.json.return_value = {
-            "values": [
-                {
-                    "objectKey": "USR-1",
-                    "label": "Matias Vazquez",
-                    "attributes": [],
-                }
-            ]
-        }
+        first_response.json.return_value = {"values": []}
         second_response = mock.Mock()
         second_response.json.return_value = {
             "values": [
@@ -558,19 +550,17 @@ class TestScriptInputs(unittest.TestCase):
                 }
             ]
         }
-        third_response = mock.Mock()
-        third_response.json.return_value = {"values": []}
         app.st.session_state.clear()
         with mock.patch.object(
             app,
             "jira_request_with_retry",
-            side_effect=[first_response, second_response, third_response],
+            side_effect=[first_response, second_response],
         ):
             lookup = app.fetch_reference_object_lookup(config, "1232-ref", mock.Mock(), {})
 
         self.assertEqual(lookup[app.normalize_lookup_key("matias.vazquez@uala.com.ar")], "USR-1")
 
-    def test_fetch_reference_object_lookup_requests_large_page_with_query_params(self) -> None:
+    def test_fetch_reference_object_lookup_uses_batch_script_payload_shape(self) -> None:
         config = app.AppConfig(
             jira_email="jira@example.com",
             jira_api_token="token",
@@ -588,10 +578,10 @@ class TestScriptInputs(unittest.TestCase):
             app.fetch_reference_object_lookup(config, "1232-ref", mock.Mock(), {})
 
         first_call = request_mock.call_args_list[0]
-        self.assertEqual(first_call.kwargs["params"]["maxResults"], 1000)
-        self.assertEqual(first_call.kwargs["params"]["startAt"], 0)
-        self.assertTrue(first_call.kwargs["params"]["includeAttributes"])
+        self.assertNotIn("params", first_call.kwargs)
         self.assertEqual(first_call.kwargs["json_payload"]["resultsPerPage"], 1000)
+        self.assertTrue(first_call.kwargs["json_payload"]["includeAttributes"])
+        self.assertEqual(first_call.kwargs["json_payload"]["qlQuery"], "objectTypeId = 1232-ref")
 
     def test_warranty_date_is_sent_as_jira_datetime(self) -> None:
         config = app.AppConfig(

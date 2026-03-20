@@ -1762,51 +1762,40 @@ def fetch_reference_object_lookup(
         f"{config.site}/rest/servicedeskapi/assets/workspace/{config.workspace_id}/v1/object/aql",
     ]
     lookup: dict[str, str] = {}
-    page_size = 1000
     for url in urls:
-        start_at = 0
-        while True:
-            try:
-                response = jira_request_with_retry(
-                    "POST",
-                    url,
-                    auth=auth,
-                    headers=headers,
-                    params={
-                        "includeAttributes": True,
-                        "startAt": start_at,
-                        "maxResults": page_size,
-                    },
-                    json_payload={
-                        "qlQuery": f"objectTypeId = {cache_key}",
-                        "includeAttributes": True,
-                        "maxResults": page_size,
-                        "startAt": start_at,
-                        "resultsPerPage": page_size,
-                    },
-                )
-            except Exception:
-                break
+        try:
+            response = jira_request_with_retry(
+                "POST",
+                url,
+                auth=auth,
+                headers=headers,
+                json_payload={
+                    "qlQuery": f"objectTypeId = {cache_key}",
+                    "includeAttributes": True,
+                    "resultsPerPage": 1000,
+                },
+            )
+        except Exception:
+            continue
 
-            body = response.json() if isinstance(response.json(), dict) else {}
-            values = body.get("values") or body.get("objectEntries") or []
-            if not isinstance(values, list) or not values:
-                break
+        body = response.json() if isinstance(response.json(), dict) else {}
+        values = body.get("values") or body.get("objectEntries") or []
+        if not isinstance(values, list) or not values:
+            continue
 
-            for item in values:
-                if not isinstance(item, dict):
-                    continue
-                object_key = str(item.get("objectKey") or item.get("key") or "").strip()
-                label = str(item.get("label") or item.get("name") or "").strip()
-                register_lookup_alias(object_key, object_key)
-                register_lookup_alias(label, object_key)
-                for attribute in item.get("attributes", []) or []:
-                    for attr_value in iter_attribute_lookup_values(attribute):
-                        register_lookup_alias(attr_value, object_key)
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            object_key = str(item.get("objectKey") or item.get("key") or "").strip()
+            label = str(item.get("label") or item.get("name") or "").strip()
+            register_lookup_alias(object_key, object_key)
+            register_lookup_alias(label, object_key)
+            for attribute in item.get("attributes", []) or []:
+                for attr_value in iter_attribute_lookup_values(attribute):
+                    register_lookup_alias(attr_value, object_key)
 
-            if len(values) < page_size:
-                break
-            start_at += page_size
+        if lookup:
+            break
 
     cache[cache_key] = dict(lookup)
     return lookup
