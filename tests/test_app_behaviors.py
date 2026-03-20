@@ -225,6 +225,51 @@ class TestScriptInputs(unittest.TestCase):
         self.assertEqual(attr_map[app.ID_MODELO], "MOD-123")
         self.assertNotIn(app.ID_ASIGNACION, attr_map)
 
+    def test_build_asset_create_payload_keeps_assignment_raw_when_schema_is_not_user_type(self) -> None:
+        config = app.AppConfig(
+            jira_email="jira@example.com",
+            jira_api_token="token",
+            workspace_id="workspace",
+            site="https://bancar.atlassian.net",
+            openai_api_key="",
+            openai_model="gpt-4o-mini",
+            rovo_api_key="",
+            rovo_enabled=False,
+        )
+        row = {
+            "Nombre del activo": "NB-03",
+            "Hostname": "NB-03",
+            "Serial Number": "SER-003",
+            "Tipo de activo": "laptops",
+            "Usuario asignado": "matias.vazquez@gmail.com",
+        }
+        attr_defs = [
+            {"id": app.ID_NAME, "name": "Name", "defaultType": {"name": "Text"}},
+            {"id": app.ID_HOSTNAME, "name": "Hostname", "defaultType": {"name": "Text"}},
+            {"id": app.ID_SERIAL, "name": "Serial Number", "defaultType": {"name": "Text"}},
+            {"id": app.ID_CATEGORIA, "name": "Categoria", "referenceObjectType": {"id": "1300-ref"}},
+            {"id": app.ID_ASIGNACION, "name": "Asignacion", "defaultType": {"name": "Text"}},
+        ]
+
+        def fake_ref_resolver(_config, reference_type_id, raw_value, _auth, *, attr_id="", headers=None):
+            if reference_type_id == "1300-ref":
+                return "CAT-1"
+            return None
+
+        with (
+            mock.patch.object(app, "fetch_object_type_attributes", return_value=attr_defs),
+            mock.patch.object(app, "resolve_reference_object_key", side_effect=fake_ref_resolver),
+            mock.patch.object(app, "fetch_attribute_option_lookup", return_value={}),
+            mock.patch.object(app, "resolve_user_account_id") as resolve_user_mock,
+        ):
+            type_id, attrs, issues = app.build_asset_create_payload(config, row)
+
+        attr_map = self._attr_map(attrs)
+        self.assertEqual(type_id, app.CATEGORY_TO_TYPE_ID["portatiles"])
+        self.assertEqual(issues, [])
+        self.assertEqual(attr_map[app.ID_ASIGNACION], "matias.vazquez@gmail.com")
+        resolve_user_mock.assert_not_called()
+
     def test_create_asset_from_payload_returns_real_error_body(self) -> None:
         config = app.AppConfig(
             jira_email="jira@example.com",

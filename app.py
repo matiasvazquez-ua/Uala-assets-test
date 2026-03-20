@@ -1866,7 +1866,7 @@ def resolve_mass_upload_attribute_value(
             return None, f"No pude resolver la referencia `{value}` para el atributo `{attr_def.get('name') or attr_id}`."
         return resolved, ""
 
-    if attr_id == ID_ASIGNACION or "user" in default_type:
+    if "user" in default_type:
         account_id = resolve_user_account_id(config, str(value), auth)
         if not account_id:
             return None, ""
