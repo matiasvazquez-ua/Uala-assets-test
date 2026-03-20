@@ -301,6 +301,43 @@ class TestScriptInputs(unittest.TestCase):
             )
         self.assertEqual(resolved, "USR-1")
 
+    def test_fetch_reference_object_lookup_indexes_raw_email_value(self) -> None:
+        config = app.AppConfig(
+            jira_email="jira@example.com",
+            jira_api_token="token",
+            workspace_id="workspace",
+            site="https://bancar.atlassian.net",
+            openai_api_key="",
+            openai_model="gpt-4o-mini",
+            rovo_api_key="",
+            rovo_enabled=False,
+        )
+        body = {
+            "values": [
+                {
+                    "objectKey": "USR-1",
+                    "label": "Matias Vazquez",
+                    "attributes": [
+                        {
+                            "objectAttributeValues": [
+                                {
+                                    "displayValue": "Matias Vazquez",
+                                    "value": "matias.vazquez@gmail.com",
+                                }
+                            ]
+                        }
+                    ],
+                }
+            ]
+        }
+        response = mock.Mock()
+        response.json.return_value = body
+        app.st.session_state.clear()
+        with mock.patch.object(app, "jira_request_with_retry", return_value=response):
+            lookup = app.fetch_reference_object_lookup(config, "1232-ref", mock.Mock(), {})
+
+        self.assertEqual(lookup[app.normalize_lookup_key("matias.vazquez@gmail.com")], "USR-1")
+
     def test_warranty_date_is_sent_as_jira_datetime(self) -> None:
         config = app.AppConfig(
             jira_email="jira@example.com",

@@ -17,7 +17,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import httpx
 import streamlit as st
@@ -1674,6 +1674,48 @@ def fetch_reference_object_lookup(
     headers: dict[str, str],
 ) -> dict[str, str]:
     """Trae objetos de referencia y arma un lookup label/key -> objectKey."""
+    def register_lookup_alias(alias: Any, object_key: str) -> None:
+        text_value = str(alias or "").strip()
+        if not text_value or not object_key:
+            return
+        normalized_text = normalize_text(text_value)
+        normalized_lookup = normalize_lookup_key(text_value)
+        compact_value = compact_lookup_key(text_value)
+        if normalized_text:
+            lookup[normalized_text] = object_key
+        if normalized_lookup:
+            lookup[normalized_lookup] = object_key
+        if compact_value:
+            lookup[compact_value] = object_key
+
+    def iter_attribute_lookup_values(attribute: dict[str, Any]) -> Iterable[str]:
+        seen_values: set[str] = set()
+        for item in attribute.get("objectAttributeValues", []) or []:
+            candidates: list[Any] = [item.get("displayValue"), item.get("searchValue")]
+            raw_value = item.get("value")
+            if isinstance(raw_value, dict):
+                candidates.extend(
+                    [
+                        raw_value.get("label"),
+                        raw_value.get("name"),
+                        raw_value.get("value"),
+                        raw_value.get("displayValue"),
+                        raw_value.get("emailAddress"),
+                        raw_value.get("searchValue"),
+                        raw_value.get("objectKey"),
+                        raw_value.get("key"),
+                    ]
+                )
+            elif raw_value not in (None, ""):
+                candidates.append(raw_value)
+
+            for candidate in candidates:
+                text_value = str(candidate or "").strip()
+                if not text_value or text_value in seen_values:
+                    continue
+                seen_values.add(text_value)
+                yield text_value
+
     cache = st.session_state.setdefault("mass_upload_reference_cache", {})
     cache_key = str(reference_object_type_id).strip()
     if cache_key in cache:
@@ -1714,21 +1756,11 @@ def fetch_reference_object_lookup(
                     continue
                 object_key = str(item.get("objectKey") or item.get("key") or "").strip()
                 label = str(item.get("label") or item.get("name") or "").strip()
-                if object_key:
-                    lookup[normalize_lookup_key(object_key)] = object_key
-                if label and object_key:
-                    lookup[normalize_lookup_key(label)] = object_key
-                    compact_label = compact_lookup_key(label)
-                    if compact_label:
-                        lookup[compact_label] = object_key
+                register_lookup_alias(object_key, object_key)
+                register_lookup_alias(label, object_key)
                 for attribute in item.get("attributes", []) or []:
-                    attr_value = extract_attr_text(attribute)
-                    if not attr_value or not object_key:
-                        continue
-                    lookup[normalize_lookup_key(attr_value)] = object_key
-                    compact_attr = compact_lookup_key(attr_value)
-                    if compact_attr:
-                        lookup[compact_attr] = object_key
+                    for attr_value in iter_attribute_lookup_values(attribute):
+                        register_lookup_alias(attr_value, object_key)
 
             if len(values) < 200:
                 break
@@ -1826,6 +1858,9 @@ def resolve_reference_object_key(
         normalize_company(raw),
     ]
     for candidate in candidates:
+        normalized_text = normalize_text(candidate)
+        if normalized_text and normalized_text in lookup:
+            return lookup[normalized_text]
         normalized = normalize_lookup_key(candidate)
         if normalized and normalized in lookup:
             return lookup[normalized]
