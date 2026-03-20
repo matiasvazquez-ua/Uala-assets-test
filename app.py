@@ -56,11 +56,16 @@ except ModuleNotFoundError:
 
 try:
     from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.datavalidation import DataValidation
 except ModuleNotFoundError:
     Workbook = None
+    Alignment = None
     Font = None
     PatternFill = None
+    get_column_letter = None
+    DataValidation = None
 
 
 def load_env_tolerant(env_path: str = ".env") -> None:
@@ -261,6 +266,54 @@ MASS_UPLOAD_COLUMN_ALIASES = {
     "provider": ["Proveedor", "Provider"],
     "category": ["Categoria", "Categoría", "Category", "Tipo", "Tipo de activo", "Object Type"],
     "company": ["Compania", "Compañía", "Company"],
+}
+MASS_UPLOAD_TEMPLATE_HEADERS = [
+    "Tipo de activo",
+    "Nombre del activo",
+    "Hostname",
+    "Serial Number",
+    "Nombre del modelo",
+    "Estado del activo",
+    "País",
+    "Compañía",
+    "Entidad del activo",
+    "Usuario asignado",
+    "Fecha de compra",
+    "Fecha garantía",
+    "Purchase Price",
+    "Provider",
+]
+MASS_UPLOAD_REQUIRED_HEADERS = [
+    "Tipo de activo",
+    "Nombre del activo",
+    "Hostname",
+    "Serial Number",
+    "Nombre del modelo",
+    "Estado del activo",
+    "País",
+]
+MASS_UPLOAD_REQUIRED_HEADER_SET = set(MASS_UPLOAD_REQUIRED_HEADERS)
+MASS_UPLOAD_TEMPLATE_EXAMPLE_ROW = {
+    "Tipo de activo": "Portátiles",
+    "Nombre del activo": "WKSAR0001L",
+    "Hostname": "WKSAR0001L",
+    "Serial Number": "ABC123XYZ",
+    "Nombre del modelo": "MacBook Air M4 16GB 512GB",
+    "Estado del activo": "Stock nuevo",
+    "País": "Argentina",
+    "Compañía": "Bancar ARG",
+    "Entidad del activo": "ALAU Tecnología S.A.U.",
+    "Usuario asignado": "",
+    "Fecha de compra": "2026-03-20",
+    "Fecha garantía": "2027-03-20",
+    "Purchase Price": "1500",
+    "Provider": "Macstation",
+}
+MASS_UPLOAD_TEMPLATE_LISTS = {
+    "Tipo de activo": ["Portátiles", "Impresoras", "Consumibles", "Celulares", "Monitores", "Accesorios de conectividad", "Tablets"],
+    "Estado del activo": ["En uso", "Stock nuevo", "Stock usado", "Asignado al edificio"],
+    "País": ["Argentina", "Colombia", "México"],
+    "Compañía": ["Bancar ARG", "Bancar COL", "Bancar MEX"],
 }
 MASS_UPDATE_IDENTIFIER_ALIASES = [
     "Serial",
@@ -5666,14 +5719,94 @@ def build_asset_attributes_payload(row: dict[str, Any]) -> tuple[str, list[dict[
         "category": ID_CATEGORIA,
         "company": ID_COMPANIA,
     }
+    resolved_values = {
+        field_name: get_row_value_by_aliases(row_lookup, MASS_UPLOAD_COLUMN_ALIASES[field_name])
+        for field_name in mapping
+    }
+    if resolved_values["country"] and not resolved_values["company"]:
+        resolved_values["company"] = company_for_country(resolved_values["country"])
     attrs: list[dict[str, Any]] = []
     for field_name, attr_id in mapping.items():
-        value = get_row_value_by_aliases(row_lookup, MASS_UPLOAD_COLUMN_ALIASES[field_name])
+        value = resolved_values[field_name]
         if value:
             attrs.append({"objectTypeAttributeId": str(attr_id), "objectAttributeValues": [{"value": value}]})
-    category_value = get_row_value_by_aliases(row_lookup, MASS_UPLOAD_COLUMN_ALIASES["category"])
+    category_value = resolved_values["category"]
     type_id = CATEGORY_TO_TYPE_ID.get(canonical_category(category_value), KNOWN_OBJECT_TYPE_IDS[0])
     return type_id, attrs
+
+
+def build_mass_upload_template_bytes() -> bytes:
+    """Genera una plantilla Excel para altas masivas de assets."""
+    if Workbook is None or Font is None or PatternFill is None or Alignment is None or get_column_letter is None:
+        raise RuntimeError("openpyxl no está disponible para generar la plantilla.")
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Carga masiva"
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(MASS_UPLOAD_TEMPLATE_HEADERS))}2"
+
+    header_fill = PatternFill(start_color="003262", end_color="003262", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+    required_fill = PatternFill(start_color="D4A12A", end_color="D4A12A", fill_type="solid")
+    example_fill = PatternFill(start_color="F6F8FC", end_color="F6F8FC", fill_type="solid")
+
+    for col_idx, header in enumerate(MASS_UPLOAD_TEMPLATE_HEADERS, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.font = header_font
+        cell.fill = required_fill if header in MASS_UPLOAD_REQUIRED_HEADER_SET else header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        example_value = MASS_UPLOAD_TEMPLATE_EXAMPLE_ROW.get(header, "")
+        example_cell = ws.cell(row=2, column=col_idx, value=example_value)
+        example_cell.fill = example_fill
+        example_cell.alignment = Alignment(vertical="center")
+
+    for col_idx, header in enumerate(MASS_UPLOAD_TEMPLATE_HEADERS, start=1):
+        values = [header]
+        if header in MASS_UPLOAD_REQUIRED_HEADER_SET:
+            values[0] = f"{header} *"
+        max_len = max(len(str(item or "")) for item in values + [MASS_UPLOAD_TEMPLATE_EXAMPLE_ROW.get(header, "")])
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len + 4, 18), 34)
+
+    ws_lists = wb.create_sheet("Listas")
+    ws_lists.sheet_state = "hidden"
+    for col_idx, (header, values) in enumerate(MASS_UPLOAD_TEMPLATE_LISTS.items(), start=1):
+        ws_lists.cell(row=1, column=col_idx, value=header)
+        for row_idx, value in enumerate(values, start=2):
+            ws_lists.cell(row=row_idx, column=col_idx, value=value)
+        if DataValidation is not None:
+            col_letter = get_column_letter(col_idx)
+            dv = DataValidation(
+                type="list",
+                formula1=f"=Listas!${col_letter}$2:${col_letter}${len(values) + 1}",
+                allow_blank=True,
+            )
+            ws.add_data_validation(dv)
+            target_col = MASS_UPLOAD_TEMPLATE_HEADERS.index(header) + 1
+            dv.add(f"{get_column_letter(target_col)}2:{get_column_letter(target_col)}1000")
+
+    ws_help = wb.create_sheet("Instrucciones")
+    instructions = [
+        ("Objetivo", "Completar una fila por asset y luego subir el archivo desde Scripts > Carga masiva."),
+        ("Campos obligatorios", ", ".join(MASS_UPLOAD_REQUIRED_HEADERS)),
+        ("Fechas", "Usar formato YYYY-MM-DD."),
+        ("Usuario asignado", "Si el activo está asignado, cargar el mail corporativo del usuario."),
+        ("Compañía", "Si se deja vacía y el país está informado, la app la deriva automáticamente."),
+        ("Referencia", "La fila 2 contiene un ejemplo listo para copiar o reemplazar."),
+    ]
+    ws_help.column_dimensions["A"].width = 22
+    ws_help.column_dimensions["B"].width = 90
+    for row_idx, (title, detail) in enumerate(instructions, start=1):
+        title_cell = ws_help.cell(row=row_idx, column=1, value=title)
+        title_cell.font = Font(bold=True)
+        detail_cell = ws_help.cell(row=row_idx, column=2, value=detail)
+        detail_cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return out.getvalue()
 
 
 def resolve_mass_update_identifier(row: dict[str, Any]) -> str:
@@ -5705,6 +5838,15 @@ def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]]) -> None
         else:
             st.info("Sin movimientos registrados")
     with tab1:
+        if Workbook is not None:
+            st.download_button(
+                "📥 Descargar plantilla de alta",
+                data=build_mass_upload_template_bytes(),
+                file_name="plantilla_alta_assets.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_mass_upload_template",
+            )
+            st.caption("La plantilla incluye columnas estándar, fila de ejemplo y listas para tipo, estado, país y compañía.")
         uploaded = st.file_uploader("Subir Excel para carga masiva", type=["xlsx", "xls"], key="mass_upload")
         if uploaded is not None and pd is not None:
             frame = pd.read_excel(uploaded)

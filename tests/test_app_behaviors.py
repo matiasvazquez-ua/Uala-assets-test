@@ -1,8 +1,10 @@
+import io
 import sys
 import unittest
 from pathlib import Path
 
 from streamlit.testing.v1 import AppTest
+from openpyxl import load_workbook
 
 
 APP_DIR = Path(__file__).resolve().parents[1]
@@ -85,9 +87,36 @@ class TestScriptInputs(unittest.TestCase):
         self.assertEqual(attr_map[app.ID_NAME], "Dock-01")
         self.assertEqual(attr_map[app.ID_HOSTNAME], "TAB-001")
 
+    def test_build_asset_payload_derives_company_from_country(self) -> None:
+        row = {
+            "Nombre del activo": "MON-01",
+            "Hostname": "MON-01",
+            "Serial Number": "SER-777",
+            "Tipo de activo": "Monitores",
+            "País": "Colombia",
+        }
+        _, attrs = app.build_asset_attributes_payload(row)
+        attr_map = self._attr_map(attrs)
+
+        self.assertEqual(attr_map[app.ID_PAIS], "Colombia")
+        self.assertEqual(attr_map[app.ID_COMPANIA], "Bancar COL")
+
     def test_mass_update_identifier_accepts_multiple_aliases(self) -> None:
         self.assertEqual(app.resolve_mass_update_identifier({"Jira Key": "ISI-31645"}), "ISI-31645")
         self.assertEqual(app.resolve_mass_update_identifier({"Host name": "WKS-001"}), "WKS-001")
+
+    def test_mass_upload_template_contains_expected_sheets_and_headers(self) -> None:
+        raw = app.build_mass_upload_template_bytes()
+        workbook = load_workbook(io.BytesIO(raw))
+
+        self.assertEqual(workbook.sheetnames, ["Carga masiva", "Listas", "Instrucciones"])
+        ws = workbook["Carga masiva"]
+        headers = [ws.cell(row=1, column=idx).value for idx in range(1, len(app.MASS_UPLOAD_TEMPLATE_HEADERS) + 1)]
+
+        self.assertEqual(headers, app.MASS_UPLOAD_TEMPLATE_HEADERS)
+        self.assertEqual(ws["A2"].value, app.MASS_UPLOAD_TEMPLATE_EXAMPLE_ROW["Tipo de activo"])
+        self.assertEqual(ws["G2"].value, app.MASS_UPLOAD_TEMPLATE_EXAMPLE_ROW["País"])
+        self.assertEqual(workbook["Listas"].sheet_state, "hidden")
 
 
 class TestChatDashboardIntegration(unittest.TestCase):
