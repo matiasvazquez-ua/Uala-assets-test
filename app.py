@@ -6700,9 +6700,10 @@ def build_consumibles_assignment_payload(config: AppConfig, row: dict[str, Any])
     return attrs, [], details
 
 
-def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]]) -> None:
+def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]], all_assets: list[dict[str, Any]] | None = None) -> None:
     """Renderiza la página de scripts: carga, modificación y reglas de normalización."""
     st.subheader("Scripts")
+    all_assets = all_assets or assets
     tab_config, tab1, tab2, tab3, tab4, tab5 = st.tabs(["⚙️ Configuración", "📥 Carga masiva", "✏️ Modificación masiva", "📦 Consumibles", "⚙️ Reglas de normalización", "🤖 Asignación automática"])
     with tab_config:
         st.markdown("**Opciones generales**")
@@ -6816,7 +6817,7 @@ def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]]) -> None
                         progress.progress(min((idx + 1) / max(total_rows, 1), 1.0))
                         continue
                     seen_serials[normalized_identifier] = idx + 1
-                    asset = find_asset_by_serial(assets, identifier)
+                    asset = find_asset_by_serial(all_assets, identifier)
                     if not asset:
                         results.append({"fila": idx + 1, "identificador": identifier, "ok": False, "detalle": "Serial no encontrado"})
                         progress.progress(min((idx + 1) / max(total_rows, 1), 1.0))
@@ -7158,7 +7159,7 @@ def main() -> None:
     elif page == "Movimientos":
         render_movimientos_page(assets)
     elif page == "Scripts":
-        render_scripts_page(config, assets)
+        render_scripts_page(config, assets, raw_assets)
     else:
         render_extra_page(config, assets)
 
