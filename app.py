@@ -6700,6 +6700,91 @@ def build_consumibles_assignment_payload(config: AppConfig, row: dict[str, Any])
     return attrs, [], details
 
 
+def build_manual_asset_create_row(
+    *,
+    category: str,
+    name: str,
+    hostname: str,
+    serial: str,
+    model: str,
+    status: str,
+    country: str,
+    company: str,
+    entity: str,
+    assignment: str,
+    purchase_date: str,
+    warranty_date: str,
+    purchase_price: str,
+    provider: str,
+) -> dict[str, str]:
+    return {
+        "Tipo de activo": category,
+        "Nombre del activo": name,
+        "Hostname": hostname,
+        "Serial Number": serial,
+        "Nombre del modelo": model,
+        "Estado del activo": status,
+        "País": country,
+        "Compañía": company,
+        "Entidad del activo": entity,
+        "Usuario asignado": assignment,
+        "Fecha de compra": purchase_date,
+        "Fecha garantía": warranty_date,
+        "Purchase Price": purchase_price,
+        "Provider": provider,
+    }
+
+
+def build_manual_asset_update_row(
+    *,
+    identifier: str,
+    name: str,
+    hostname: str,
+    model: str,
+    status: str,
+    country: str,
+    company: str,
+    entity: str,
+    assignment: str,
+    purchase_date: str,
+    warranty_date: str,
+    purchase_price: str,
+    provider: str,
+    category: str,
+) -> dict[str, str]:
+    row = {"Serial Number": identifier}
+    optional_map = {
+        "Nombre del activo": name,
+        "Hostname": hostname,
+        "Nombre del modelo": model,
+        "Estado del activo": status,
+        "País": country,
+        "Compañía": company,
+        "Entidad del activo": entity,
+        "Usuario asignado": assignment,
+        "Fecha de compra": purchase_date,
+        "Fecha garantía": warranty_date,
+        "Purchase Price": purchase_price,
+        "Provider": provider,
+        "Tipo de activo": category,
+    }
+    for key, value in optional_map.items():
+        if str(value or "").strip():
+            row[key] = str(value).strip()
+    return row
+
+
+def build_manual_consumibles_row(*, name: str, user: str, consumible: str, quantity: str, assignment_date: str, ticket: str) -> dict[str, str]:
+    return {
+        "Name (1061)": name,
+        "Usuario asignado (1062)": user,
+        "Consumibles (1063)": consumible,
+        "Cantidad (1064)": quantity,
+        "Fecha de asignacion (1065)": assignment_date,
+        "Ticket Jira (1066)": ticket,
+    }
+
+
 def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]], all_assets: list[dict[str, Any]] | None = None) -> None:
     """Renderiza la página de scripts: carga, modificación y reglas de normalización."""
     st.subheader("Scripts")
@@ -6734,6 +6819,58 @@ def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]], all_ass
                 key="download_mass_upload_template",
             )
             st.caption("La plantilla incluye columnas estándar, fila de ejemplo y listas para tipo, estado, país y compañía.")
+        st.markdown("**Alta individual**")
+        with st.form("manual_asset_create_form", clear_on_submit=False):
+            c1, c2 = st.columns(2)
+            create_category = c1.selectbox("Tipo de activo", MASS_UPLOAD_TEMPLATE_LISTS["Tipo de activo"], key="manual_create_category")
+            create_status = c2.selectbox("Estado del activo", MASS_UPLOAD_TEMPLATE_LISTS["Estado del activo"], key="manual_create_status")
+            c3, c4 = st.columns(2)
+            create_name = c3.text_input("Nombre del activo", key="manual_create_name")
+            create_hostname = c4.text_input("Hostname", key="manual_create_hostname")
+            c5, c6 = st.columns(2)
+            create_serial = c5.text_input("Serial Number", key="manual_create_serial")
+            create_model = c6.text_input("Nombre del modelo", key="manual_create_model")
+            c7, c8 = st.columns(2)
+            create_country = c7.selectbox("País", MASS_UPLOAD_TEMPLATE_LISTS["País"], key="manual_create_country")
+            create_company = c8.selectbox("Compañía", [""] + MASS_UPLOAD_TEMPLATE_LISTS["Compañía"], key="manual_create_company")
+            c9, c10 = st.columns(2)
+            create_entity = c9.text_input("Entidad del activo", key="manual_create_entity")
+            create_assignment = c10.text_input("Usuario asignado", key="manual_create_assignment")
+            c11, c12, c13 = st.columns(3)
+            create_purchase_date = c11.text_input("Fecha de compra", key="manual_create_purchase_date", placeholder="YYYY-MM-DD")
+            create_warranty_date = c12.text_input("Fecha garantía", key="manual_create_warranty_date", placeholder="YYYY-MM-DD")
+            create_price = c13.text_input("Purchase Price", key="manual_create_price")
+            create_provider = st.text_input("Provider", key="manual_create_provider")
+            submitted_create = st.form_submit_button("➕ Crear asset")
+        if submitted_create:
+            row_dict = build_manual_asset_create_row(
+                category=create_category,
+                name=create_name,
+                hostname=create_hostname,
+                serial=create_serial,
+                model=create_model,
+                status=create_status,
+                country=create_country,
+                company=create_company,
+                entity=create_entity,
+                assignment=create_assignment,
+                purchase_date=create_purchase_date,
+                warranty_date=create_warranty_date,
+                purchase_price=create_price,
+                provider=create_provider,
+            )
+            type_id, attrs, issues = build_asset_create_payload(config, row_dict)
+            if issues:
+                st.error(" | ".join(issues[:5]))
+            elif not attrs:
+                st.error("No se pudieron construir atributos válidos para el alta.")
+            else:
+                ok, msg = create_asset_from_payload(config, type_id, attrs)
+                if ok:
+                    log_movimiento(config, None, "ALTA_INDIVIDUAL", "asset", "", create_name, "OK", msg, create_serial or create_hostname or create_name)
+                    st.success(msg)
+                else:
+                    st.error(msg)
         uploaded = st.file_uploader("Subir Excel para carga masiva", type=["xlsx", "xls"], key="mass_upload")
         if uploaded is not None and pd is not None:
             frame = pd.read_excel(uploaded)
@@ -6783,6 +6920,72 @@ def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]], all_ass
                 key="download_mass_update_template",
             )
             st.caption("Completá el Serial Number y solo las columnas que querés actualizar. La fila de ejemplo se omite automáticamente.")
+        st.markdown("**Modificación individual**")
+        with st.form("manual_asset_update_form", clear_on_submit=False):
+            update_identifier = st.text_input("Serial Number del asset", key="manual_update_identifier")
+            existing_asset = find_asset_by_serial(all_assets, update_identifier) if update_identifier.strip() else None
+            if existing_asset:
+                st.caption(
+                    f"Asset encontrado: {existing_asset.get('jira_key') or existing_asset.get('name')} | "
+                    f"Hostname: {existing_asset.get('hostname') or 'N/A'} | "
+                    f"Estado: {existing_asset.get('status') or 'N/A'}"
+                )
+            cu1, cu2 = st.columns(2)
+            update_name = cu1.text_input("Nombre del activo", key="manual_update_name")
+            update_hostname = cu2.text_input("Hostname", key="manual_update_hostname")
+            cu3, cu4 = st.columns(2)
+            update_model = cu3.text_input("Nombre del modelo", key="manual_update_model")
+            update_status = cu4.selectbox("Estado del activo", [""] + MASS_UPLOAD_TEMPLATE_LISTS["Estado del activo"], key="manual_update_status")
+            cu5, cu6 = st.columns(2)
+            update_country = cu5.selectbox("País", [""] + MASS_UPLOAD_TEMPLATE_LISTS["País"], key="manual_update_country")
+            update_company = cu6.selectbox("Compañía", [""] + MASS_UPLOAD_TEMPLATE_LISTS["Compañía"], key="manual_update_company")
+            cu7, cu8 = st.columns(2)
+            update_entity = cu7.text_input("Entidad del activo", key="manual_update_entity")
+            update_assignment = cu8.text_input("Usuario asignado", key="manual_update_assignment")
+            cu9, cu10, cu11 = st.columns(3)
+            update_purchase_date = cu9.text_input("Fecha de compra", key="manual_update_purchase_date", placeholder="YYYY-MM-DD")
+            update_warranty_date = cu10.text_input("Fecha garantía", key="manual_update_warranty_date", placeholder="YYYY-MM-DD")
+            update_price = cu11.text_input("Purchase Price", key="manual_update_price")
+            cu12, cu13 = st.columns(2)
+            update_provider = cu12.text_input("Provider", key="manual_update_provider")
+            update_category = cu13.selectbox("Tipo de activo", [""] + MASS_UPLOAD_TEMPLATE_LISTS["Tipo de activo"], key="manual_update_category")
+            submitted_update = st.form_submit_button("✏️ Modificar asset")
+        if submitted_update:
+            if not update_identifier.strip():
+                st.error("Informá el Serial Number del asset.")
+            else:
+                asset = find_asset_by_serial(all_assets, update_identifier)
+                if not asset:
+                    st.error("Serial no encontrado.")
+                else:
+                    row_dict = build_manual_asset_update_row(
+                        identifier=update_identifier,
+                        name=update_name,
+                        hostname=update_hostname,
+                        model=update_model,
+                        status=update_status,
+                        country=update_country,
+                        company=update_company,
+                        entity=update_entity,
+                        assignment=update_assignment,
+                        purchase_date=update_purchase_date,
+                        warranty_date=update_warranty_date,
+                        purchase_price=update_price,
+                        provider=update_provider,
+                        category=update_category,
+                    )
+                    type_id, attrs, issues = build_asset_update_payload(config, str(asset.get("object_type_id") or ""), row_dict)
+                    if issues:
+                        st.error(" | ".join(issues[:5]))
+                    elif not attrs:
+                        st.warning("Sin cambios para aplicar.")
+                    else:
+                        ok, msg = update_asset_attributes(config, str(asset.get("object_id", "")), str(asset.get("object_type_id") or type_id), attrs)
+                        if ok:
+                            log_movimiento(config, asset, "MODIFICACION_INDIVIDUAL", "multiple", "", "updated", "OK", msg, update_identifier)
+                            st.success(msg)
+                        else:
+                            st.error(msg)
         uploaded_mod = st.file_uploader("Subir Excel para modificación masiva", type=["xlsx", "xls"], key="mass_update")
         if uploaded_mod is not None and pd is not None:
             frame_mod = pd.read_excel(uploaded_mod).fillna("")
@@ -6852,6 +7055,48 @@ def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]], all_ass
                 key="download_consumibles_template",
             )
             st.caption("Creá una fila por asignación. La app genera un objeto en Asignaciones (230) y Jira descuenta el stock del consumible.")
+        st.markdown("**Asignación manual de consumibles**")
+        with st.form("manual_consumibles_form", clear_on_submit=False):
+            cm1, cm2 = st.columns(2)
+            manual_consumible_user = cm1.text_input("Usuario asignado", key="manual_consumible_user")
+            manual_consumible_item = cm2.text_input("Consumible", key="manual_consumible_item", placeholder="Ej: hub")
+            cm3, cm4, cm5 = st.columns(3)
+            manual_consumible_qty = cm3.number_input("Cantidad", min_value=1, step=1, value=1, key="manual_consumible_qty")
+            manual_consumible_date = cm4.text_input("Fecha de asignación", key="manual_consumible_date", placeholder="YYYY-MM-DD")
+            manual_consumible_ticket = cm5.text_input("Ticket Jira", key="manual_consumible_ticket")
+            manual_consumible_name = st.text_input("Nombre de la asignación", key="manual_consumible_name", placeholder="Opcional")
+            submitted_consumible = st.form_submit_button("📦 Asignar consumible")
+        if submitted_consumible:
+            row_dict = build_manual_consumibles_row(
+                name=manual_consumible_name,
+                user=manual_consumible_user,
+                consumible=manual_consumible_item,
+                quantity=str(int(manual_consumible_qty)),
+                assignment_date=manual_consumible_date,
+                ticket=manual_consumible_ticket,
+            )
+            attrs, issues, details = build_consumibles_assignment_payload(config, row_dict)
+            if issues:
+                st.error(" | ".join(issues[:5]))
+            elif not attrs:
+                st.error("No se pudieron construir atributos válidos para la asignación.")
+            else:
+                ok, msg = create_asset_from_payload(config, CONSUMIBLES_ASSIGNMENT_TYPE_ID, attrs)
+                if ok:
+                    log_movimiento(
+                        config,
+                        None,
+                        "CONSUMIBLE_INDIVIDUAL",
+                        "consumible",
+                        "",
+                        str(details.get("consumible") or details.get("consumible_key") or ""),
+                        "OK",
+                        msg,
+                        str(details.get("name") or ""),
+                    )
+                    st.success(msg)
+                else:
+                    st.error(msg)
         uploaded_consumibles = st.file_uploader("Subir Excel para asignaciones de consumibles", type=["xlsx", "xls"], key="mass_consumibles")
         if uploaded_consumibles is not None and pd is not None:
             frame_consumibles = pd.read_excel(uploaded_consumibles).fillna("")
