@@ -73,7 +73,7 @@ class TestScriptInputs(unittest.TestCase):
         self.assertEqual(attr_map[app.ID_MODELO], "ThinkPad X1")
         self.assertEqual(attr_map[app.ID_PAIS], "México")
         self.assertEqual(attr_map[app.ID_COMPANIA], "Bancar MEX")
-        self.assertEqual(attr_map[app.ID_ASIGNACION], "ana@bancar.com")
+        self.assertEqual(attr_map[app.ID_USUARIO], "ana@bancar.com")
 
     def test_build_asset_payload_uses_tipo_when_category_is_missing(self) -> None:
         row = {
@@ -144,7 +144,7 @@ class TestScriptInputs(unittest.TestCase):
             {"id": app.ID_HOSTNAME, "name": "Hostname", "defaultType": {"name": "Text"}},
             {"id": app.ID_SERIAL, "name": "Serial Number", "defaultType": {"name": "Text"}},
             {"id": app.ID_ESTADO, "name": "Estado del activo", "defaultType": {"name": "Status"}},
-            {"id": app.ID_ASIGNACION, "name": "Usuario asignado", "defaultType": {"name": "User"}},
+            {"id": app.ID_USUARIO, "name": "Usuario asignado", "defaultType": {"name": "User"}},
             {"id": app.ID_CATEGORIA, "name": "Categoria", "referenceObjectType": {"id": "1300-ref"}},
             {"id": app.ID_COMPANIA, "name": "Compañía", "referenceObjectType": {"id": "1337-ref"}},
         ]
@@ -171,7 +171,7 @@ class TestScriptInputs(unittest.TestCase):
         self.assertEqual(type_id, app.CATEGORY_TO_TYPE_ID["portatiles"])
         self.assertEqual(issues, [])
         self.assertEqual(attr_map[app.ID_ESTADO], "STATUS-1")
-        self.assertEqual(attr_map[app.ID_ASIGNACION], "acc-123")
+        self.assertEqual(attr_map[app.ID_USUARIO], "acc-123")
         self.assertEqual(attr_map[app.ID_CATEGORIA], "CAT-1")
         self.assertEqual(attr_map[app.ID_COMPANIA], "COM-1")
 
@@ -199,7 +199,7 @@ class TestScriptInputs(unittest.TestCase):
             {"id": app.ID_HOSTNAME, "name": "Hostname", "defaultType": {"name": "Text"}},
             {"id": app.ID_SERIAL, "name": "Serial Number", "defaultType": {"name": "Text"}},
             {"id": app.ID_MODELO, "name": "Nombre del modelo", "referenceObjectType": {"id": "994-ref"}},
-            {"id": app.ID_ASIGNACION, "name": "Asignacion", "defaultType": {"name": "User"}},
+            {"id": app.ID_USUARIO, "name": "Usuario asignado", "defaultType": {"name": "User"}},
             {"id": app.ID_CATEGORIA, "name": "Categoria", "referenceObjectType": {"id": "1300-ref"}},
         ]
 
@@ -223,7 +223,7 @@ class TestScriptInputs(unittest.TestCase):
         self.assertEqual(type_id, app.CATEGORY_TO_TYPE_ID["portatiles"])
         self.assertEqual(issues, [])
         self.assertEqual(attr_map[app.ID_MODELO], "MOD-123")
-        self.assertNotIn(app.ID_ASIGNACION, attr_map)
+        self.assertNotIn(app.ID_USUARIO, attr_map)
 
     def test_build_asset_create_payload_keeps_assignment_raw_when_schema_is_not_user_type(self) -> None:
         config = app.AppConfig(
@@ -248,7 +248,7 @@ class TestScriptInputs(unittest.TestCase):
             {"id": app.ID_HOSTNAME, "name": "Hostname", "defaultType": {"name": "Text"}},
             {"id": app.ID_SERIAL, "name": "Serial Number", "defaultType": {"name": "Text"}},
             {"id": app.ID_CATEGORIA, "name": "Categoria", "referenceObjectType": {"id": "1300-ref"}},
-            {"id": app.ID_ASIGNACION, "name": "Asignacion", "defaultType": {"name": "Text"}},
+            {"id": app.ID_USUARIO, "name": "Usuario asignado", "defaultType": {"name": "Text"}},
         ]
 
         def fake_ref_resolver(_config, reference_type_id, raw_value, _auth, *, attr_id="", headers=None):
@@ -267,7 +267,7 @@ class TestScriptInputs(unittest.TestCase):
         attr_map = self._attr_map(attrs)
         self.assertEqual(type_id, app.CATEGORY_TO_TYPE_ID["portatiles"])
         self.assertEqual(issues, [])
-        self.assertEqual(attr_map[app.ID_ASIGNACION], "matias.vazquez@gmail.com")
+        self.assertEqual(attr_map[app.ID_USUARIO], "matias.vazquez@gmail.com")
         resolve_user_mock.assert_not_called()
 
     def test_resolve_reference_object_key_matches_email_inside_label(self) -> None:

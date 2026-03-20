@@ -135,6 +135,7 @@ ID_FECHA_GARANTIA = "1089"
 ID_COSTO = "1090"
 ID_SERIAL = "1091"
 ID_PAIS = "1092"
+ID_USUARIO = "1042"
 ID_ASIGNACION = "1232"
 ID_PROVEEDOR = "1265"
 ID_CATEGORIA = "1300"
@@ -262,7 +263,8 @@ MASS_UPLOAD_COLUMN_ALIASES = {
     "cost": ["Costo", "Cost", "Precio", "Purchase Price"],
     "serial": ["Serial", "Serial Number", "Número de serie", "Numero de serie"],
     "country": ["Pais", "País", "Country"],
-    "assignment": ["Asignacion", "Asignación", "Assigned To", "Usuario asignado", "Asignado a"],
+    "assignment": ["Usuario asignado", "Usuario", "User assigned", "Assigned user"],
+    "assignment_ref": ["Asignacion", "Asignación", "Assigned To", "Asignado a"],
     "provider": ["Proveedor", "Provider"],
     "category": ["Categoria", "Categoría", "Category", "Tipo", "Tipo de activo", "Object Type"],
     "company": ["Compania", "Compañía", "Company"],
@@ -361,7 +363,8 @@ SCHEMA_MINI = {
         {"id": ID_HOSTNAME, "name": "Hostname"},
         {"id": ID_SERIAL, "name": "Serial Number"},
         {"id": ID_ESTADO, "name": "Estado del activo"},
-        {"id": ID_ASIGNACION, "name": "Usuario asignado"},
+        {"id": ID_USUARIO, "name": "Usuario asignado"},
+        {"id": ID_ASIGNACION, "name": "Asignacion"},
         {"id": ID_MODELO, "name": "Nombre del modelo"},
         {"id": ID_PAIS, "name": "Pais"},
         {"id": ID_COMPANIA, "name": "Compañía"},
@@ -2003,7 +2006,7 @@ def update_asset_assignment(config: AppConfig, object_id: str, object_type_id: s
     payload = {
         "objectTypeId": str(object_type_id),
         "attributes": [
-            {"objectTypeAttributeId": ID_ASIGNACION, "objectAttributeValues": [{"value": assignee_value}]},
+            {"objectTypeAttributeId": ID_USUARIO, "objectAttributeValues": [{"value": assignee_value}]},
             {"objectTypeAttributeId": ID_ESTADO, "objectAttributeValues": [{"value": "En uso"}]},
         ],
     }
@@ -2642,9 +2645,16 @@ def clean_asset_object(asset: dict[str, Any]) -> AssetRecord:
     assigned_raw = get_attr_value(
         attrs_by_id,
         attrs_by_name,
-        ID_ASIGNACION,
-        ["Asignacion", "Asignación", "Assigned To", "Asignado a", "Usuario asignado", "User assigned"],
+        ID_USUARIO,
+        ["Usuario asignado", "User assigned"],
     )
+    if not assigned_raw:
+        assigned_raw = get_attr_value(
+            attrs_by_id,
+            attrs_by_name,
+            ID_ASIGNACION,
+            ["Asignacion", "Asignación", "Assigned To", "Asignado a"],
+        )
     status_final, assigned_final = enforce_assignment_status_rules(canonical_status(status_raw), assigned_raw)
 
     return AssetRecord(
@@ -3393,7 +3403,11 @@ def assign_asset(config: AppConfig, assets: list[dict[str, Any]], identifier: st
         assignee_value = account_id
     assignee_attr_id = resolve_attr_id(
         candidate,
-        ["Usuario asignado", "Asignado a", "Assigned To", "User assigned", "Asignación", "Asignacion"],
+        ["Usuario asignado", "User assigned"],
+        ID_USUARIO,
+    ) or resolve_attr_id(
+        candidate,
+        ["Asignado a", "Assigned To", "Asignación", "Asignacion"],
         ID_ASIGNACION,
     )
     status_attr_id = resolve_attr_id(candidate, ["Estado del activo", "Estado", "Status"], ID_ESTADO)
@@ -3435,7 +3449,11 @@ def unassign_asset(config: AppConfig, assets: list[dict[str, Any]], identifier: 
 
     assignee_attr_id = resolve_attr_id(
         candidate,
-        ["Usuario asignado", "Asignado a", "Assigned To", "User assigned", "Asignación", "Asignacion"],
+        ["Usuario asignado", "User assigned"],
+        ID_USUARIO,
+    ) or resolve_attr_id(
+        candidate,
+        ["Asignado a", "Assigned To", "Asignación", "Asignacion"],
         ID_ASIGNACION,
     )
     status_attr_id = resolve_attr_id(candidate, ["Estado del activo", "Estado", "Status"], ID_ESTADO)
@@ -6071,7 +6089,8 @@ def build_asset_attributes_payload(row: dict[str, Any]) -> tuple[str, list[dict[
         "cost": ID_COSTO,
         "serial": ID_SERIAL,
         "country": ID_PAIS,
-        "assignment": ID_ASIGNACION,
+        "assignment": ID_USUARIO,
+        "assignment_ref": ID_ASIGNACION,
         "provider": ID_PROVEEDOR,
         "category": ID_CATEGORIA,
         "company": ID_COMPANIA,
