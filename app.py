@@ -1601,6 +1601,248 @@ def fetch_object_type_attributes(config: AppConfig, object_type_id: str, auth: B
     return []
 
 
+def parse_attribute_options_payload(payload: Any) -> list[tuple[str, str]]:
+    """Normaliza respuestas de Jira que exponen opciones en distintos shapes."""
+    if isinstance(payload, list):
+        raw_items = payload
+    elif isinstance(payload, dict):
+        raw_items = payload.get("values") or payload.get("options") or payload.get("items") or []
+    else:
+        raw_items = []
+
+    parsed: list[tuple[str, str]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        option_id = str(item.get("id") or item.get("optionId") or item.get("value") or "").strip()
+        option_name = str(item.get("name") or item.get("label") or item.get("displayValue") or "").strip()
+        if option_id and option_name:
+            parsed.append((option_name, option_id))
+    return parsed
+
+
+def fetch_attribute_option_lookup(config: AppConfig, attr_id: str, auth: BasicAuth, headers: dict[str, str]) -> dict[str, str]:
+    """Trae opciones válidas de un atributo y las indexa por label normalizado."""
+    cache = st.session_state.setdefault("mass_upload_option_cache", {})
+    cache_key = str(attr_id).strip()
+    if cache_key in cache:
+        return dict(cache[cache_key])
+
+    urls = [
+        f"{config.site}/gateway/api/jsm/assets/workspace/{config.workspace_id}/v1/objecttypeattribute/{attr_id}/values",
+        f"{config.site}/gateway/api/jsm/assets/workspace/{config.workspace_id}/v1/objecttypeattribute/{attr_id}",
+        f"{config.site}/rest/servicedeskapi/assets/workspace/{config.workspace_id}/v1/objecttypeattribute/{attr_id}/values",
+        f"{config.site}/rest/servicedeskapi/assets/workspace/{config.workspace_id}/v1/objecttypeattribute/{attr_id}",
+    ]
+    lookup: dict[str, str] = {}
+    for url in urls:
+        try:
+            response = jira_request_with_retry("GET", url, auth=auth, headers=headers)
+            for option_name, option_id in parse_attribute_options_payload(response.json()):
+                normalized = normalize_lookup_key(option_name)
+                if normalized and option_id:
+                    lookup[normalized] = option_id
+        except Exception:
+            continue
+
+    cache[cache_key] = dict(lookup)
+    return lookup
+
+
+def fetch_reference_object_lookup(
+    config: AppConfig,
+    reference_object_type_id: str,
+    auth: BasicAuth,
+    headers: dict[str, str],
+) -> dict[str, str]:
+    """Trae objetos de referencia y arma un lookup label/key -> objectKey."""
+    cache = st.session_state.setdefault("mass_upload_reference_cache", {})
+    cache_key = str(reference_object_type_id).strip()
+    if cache_key in cache:
+        return dict(cache[cache_key])
+
+    urls = [
+        f"{config.site}/gateway/api/jsm/assets/workspace/{config.workspace_id}/v1/object/aql",
+        f"{config.site}/gateway/api/jsm/assets/workspace/{config.workspace_id}/v1/object/navlist/aql",
+        f"{config.site}/rest/servicedeskapi/assets/workspace/{config.workspace_id}/v1/object/aql",
+    ]
+    lookup: dict[str, str] = {}
+    for url in urls:
+        start_at = 0
+        while True:
+            try:
+                response = jira_request_with_retry(
+                    "POST",
+                    url,
+                    auth=auth,
+                    headers=headers,
+                    json_payload={
+                        "qlQuery": f"objectTypeId = {cache_key}",
+                        "includeAttributes": False,
+                        "maxResults": 200,
+                        "startAt": start_at,
+                    },
+                )
+            except Exception:
+                break
+
+            body = response.json() if isinstance(response.json(), dict) else {}
+            values = body.get("values") or body.get("objectEntries") or []
+            if not isinstance(values, list) or not values:
+                break
+
+            for item in values:
+                if not isinstance(item, dict):
+                    continue
+                object_key = str(item.get("objectKey") or item.get("key") or "").strip()
+                label = str(item.get("label") or item.get("name") or "").strip()
+                if object_key:
+                    lookup[normalize_lookup_key(object_key)] = object_key
+                if label and object_key:
+                    lookup[normalize_lookup_key(label)] = object_key
+
+            if len(values) < 200:
+                break
+            start_at += 200
+
+        if lookup:
+            break
+
+    cache[cache_key] = dict(lookup)
+    return lookup
+
+
+def resolve_reference_object_key(
+    config: AppConfig,
+    reference_object_type_id: str,
+    raw_value: str,
+    auth: BasicAuth,
+    headers: dict[str, str],
+) -> str | None:
+    """Resuelve texto visible a objectKey para atributos de referencia."""
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return None
+    if re.fullmatch(r"[A-Z]+-\d+", raw):
+        return raw
+
+    lookup = fetch_reference_object_lookup(config, reference_object_type_id, auth, headers)
+    if not lookup:
+        return None
+
+    candidates = [
+        raw,
+        canonical_category(raw),
+        canonical_country(raw),
+        normalize_company(raw),
+    ]
+    for candidate in candidates:
+        normalized = normalize_lookup_key(candidate)
+        if normalized and normalized in lookup:
+            return lookup[normalized]
+
+    normalized_raw = normalize_lookup_key(raw)
+    for key, object_key in lookup.items():
+        if normalized_raw and (normalized_raw in key or key in normalized_raw):
+            return object_key
+    return None
+
+
+def resolve_mass_upload_attribute_value(
+    config: AppConfig,
+    attr_id: str,
+    raw_value: Any,
+    attr_def: dict[str, Any],
+    auth: BasicAuth,
+    headers: dict[str, str],
+) -> tuple[Any | None, str]:
+    """Convierte el valor tabular al formato esperado por Jira Assets."""
+    raw = normalize_tabular_value(raw_value)
+    if not raw:
+        return None, ""
+
+    value = raw
+    default_type = normalize_lookup_key((attr_def.get("defaultType") or {}).get("name") or attr_def.get("type") or "")
+    reference_object_type_id = str((attr_def.get("referenceObjectType") or {}).get("id") or "").strip()
+
+    if attr_id == ID_ESTADO:
+        value = canonical_status(raw)
+    elif attr_id == ID_PAIS:
+        value = canonical_country(raw)
+    elif attr_id == ID_COMPANIA:
+        value = normalize_company(raw)
+    elif attr_id == ID_COSTO:
+        return parse_cost(raw), ""
+    elif attr_id in {ID_FECHA_COMPRA, ID_FECHA_GARANTIA}:
+        parsed_date = parse_date(raw)
+        return (parsed_date.strftime("%Y-%m-%d") if parsed_date else raw), ""
+
+    if reference_object_type_id:
+        resolved = resolve_reference_object_key(config, reference_object_type_id, str(value), auth, headers)
+        if not resolved:
+            return None, f"No pude resolver la referencia `{value}` para el atributo `{attr_def.get('name') or attr_id}`."
+        return resolved, ""
+
+    if attr_id == ID_ASIGNACION or "user" in default_type:
+        account_id = resolve_user_account_id(config, str(value), auth)
+        if not account_id:
+            return None, f"No pude resolver el usuario `{value}` a accountId."
+        return account_id, ""
+
+    option_lookup = fetch_attribute_option_lookup(config, attr_id, auth, headers)
+    if option_lookup:
+        normalized = normalize_lookup_key(str(value))
+        if normalized in option_lookup:
+            return option_lookup[normalized], ""
+
+    return value, ""
+
+
+def build_asset_create_payload(config: AppConfig, row: dict[str, Any]) -> tuple[str, list[dict[str, Any]], list[str]]:
+    """Arma payload de alta resolviendo referencias, usuarios y opciones."""
+    type_id, attrs = build_asset_attributes_payload(row)
+    auth, headers = build_auth_headers(config)
+    attr_defs = fetch_object_type_attributes(config, type_id, auth, headers)
+    attr_defs_by_id = {str(attr.get("id") or "").strip(): attr for attr in attr_defs if str(attr.get("id") or "").strip()}
+
+    resolved_attrs: list[dict[str, Any]] = []
+    issues: list[str] = []
+
+    for attr in attrs:
+        attr_id = str(attr.get("objectTypeAttributeId") or "").strip()
+        raw_values = attr.get("objectAttributeValues") or []
+        raw_value = raw_values[0].get("value") if raw_values else ""
+        attr_def = attr_defs_by_id.get(attr_id, {})
+
+        resolved_value, issue = resolve_mass_upload_attribute_value(config, attr_id, raw_value, attr_def, auth, headers)
+        if issue:
+            issues.append(issue)
+            continue
+        if resolved_value in (None, ""):
+            continue
+        resolved_attrs.append({"objectTypeAttributeId": attr_id, "objectAttributeValues": [{"value": resolved_value}]})
+
+    return type_id, resolved_attrs, issues
+
+
+def create_asset_from_payload(config: AppConfig, object_type_id: str, attrs: list[dict[str, Any]]) -> tuple[bool, str]:
+    """Crea un asset usando la ruta de alta que sí utiliza el script batch existente."""
+    auth, headers = build_auth_headers(config)
+    url = f"{config.site}/gateway/api/jsm/assets/workspace/{config.workspace_id}/v1/object/create"
+    payload = {"objectTypeId": str(object_type_id), "attributes": attrs}
+    try:
+        with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+            response = client.post(url, auth=auth, headers=headers, json=payload)
+        if response.status_code in (200, 201):
+            body = response.json() if response.text else {}
+            created_key = str(body.get("objectKey") or body.get("key") or "").strip()
+            return True, f"Creado{f' ({created_key})' if created_key else ''}"
+        detail = response.text.strip()[:1000] or "sin detalle"
+        return False, f"Error creando asset ({response.status_code}): {detail}"
+    except httpx.HTTPError as exc:
+        return False, f"Error creando asset: {exc}"
+
+
 def fetch_schema_bridge(config: AppConfig) -> dict[str, list[dict[str, Any]]]:
     auth, headers = build_auth_headers(config)
     bridge: dict[str, list[dict[str, Any]]] = {}
@@ -5856,35 +6098,28 @@ def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]]) -> None
                 total_rows = len(frame)
                 results = []
                 for idx, row in frame.fillna("").iterrows():
-                    type_id, attrs = build_asset_attributes_payload(row.to_dict())
-                    if attrs:
-                        auth, headers = build_auth_headers(config)
-                        create_urls = [
-                            f"{config.site}/gateway/api/jsm/assets/workspace/{config.workspace_id}/v1/object/create",
-                            f"{config.site}/rest/servicedeskapi/assets/workspace/{config.workspace_id}/v1/object/create",
-                        ]
-                        ok = False
-                        msg = "No se pudo crear activo."
-                        for create_url in create_urls:
-                            try:
-                                response = jira_request_with_retry(
-                                    "POST",
-                                    create_url,
-                                    auth=auth,
-                                    headers=headers,
-                                    json_payload={"objectTypeId": str(type_id), "attributes": attrs},
-                                )
-                                if response.status_code in (200, 201):
-                                    ok = True
-                                    msg = "Creado"
-                                    break
-                            except RuntimeError as exc:
-                                msg = str(exc)
+                    row_dict = row.to_dict()
+                    type_id, attrs, issues = build_asset_create_payload(config, row_dict)
+                    if issues:
+                        ok, msg = False, " | ".join(issues[:3])
+                    elif attrs:
+                        ok, msg = create_asset_from_payload(config, type_id, attrs)
                     else:
-                        ok, msg = False, "Sin atributos"
+                        ok, msg = False, "Sin atributos válidos para crear"
                     if ok:
-                        log_movimiento(config, None, "CARGA_MASIVA", "asset", "", row.get("Nombre", ""), "OK", msg, str(row.get("Serial", "")))
-                    results.append({"fila": idx + 1, "ok": ok, "detalle": msg})
+                        row_lookup = build_row_lookup(row_dict)
+                        log_movimiento(
+                            config,
+                            None,
+                            "CARGA_MASIVA",
+                            "asset",
+                            "",
+                            get_row_value_by_aliases(row_lookup, MASS_UPLOAD_COLUMN_ALIASES["name"]),
+                            "OK",
+                            msg,
+                            get_row_value_by_aliases(row_lookup, MASS_UPLOAD_COLUMN_ALIASES["serial"]),
+                        )
+                    results.append({"fila": idx + 1, "ok": ok, "detalle": msg, "type_id": type_id})
                     progress.progress(min((idx + 1) / max(total_rows, 1), 1.0))
                 st.dataframe(results, use_container_width=True, hide_index=True)
                 if st.button("Refrescar inventario", key="refresh_after_load"):
