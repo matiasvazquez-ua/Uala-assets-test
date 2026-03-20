@@ -149,7 +149,7 @@ class TestScriptInputs(unittest.TestCase):
             {"id": app.ID_COMPANIA, "name": "Compañía", "referenceObjectType": {"id": "1337-ref"}},
         ]
 
-        def fake_ref_resolver(_config, reference_type_id, raw_value, _auth, _headers):
+        def fake_ref_resolver(_config, reference_type_id, raw_value, _auth, *, attr_id="", headers=None):
             if reference_type_id == "1300-ref":
                 return "CAT-1"
             if reference_type_id == "1337-ref" and raw_value == "Bancar ARG":
@@ -174,6 +174,56 @@ class TestScriptInputs(unittest.TestCase):
         self.assertEqual(attr_map[app.ID_ASIGNACION], "acc-123")
         self.assertEqual(attr_map[app.ID_CATEGORIA], "CAT-1")
         self.assertEqual(attr_map[app.ID_COMPANIA], "COM-1")
+
+    def test_build_asset_create_payload_creates_missing_model_and_skips_unknown_assignment(self) -> None:
+        config = app.AppConfig(
+            jira_email="jira@example.com",
+            jira_api_token="token",
+            workspace_id="workspace",
+            site="https://bancar.atlassian.net",
+            openai_api_key="",
+            openai_model="gpt-4o-mini",
+            rovo_api_key="",
+            rovo_enabled=False,
+        )
+        row = {
+            "Nombre del activo": "NB-02",
+            "Hostname": "NB-02",
+            "Serial Number": "SER-002",
+            "Tipo de activo": "laptops",
+            "Nombre del modelo": "MacBook Air M4 16GB 512GB",
+            "Usuario asignado": "matias.vazquez@gmail.com",
+        }
+        attr_defs = [
+            {"id": app.ID_NAME, "name": "Name", "defaultType": {"name": "Text"}},
+            {"id": app.ID_HOSTNAME, "name": "Hostname", "defaultType": {"name": "Text"}},
+            {"id": app.ID_SERIAL, "name": "Serial Number", "defaultType": {"name": "Text"}},
+            {"id": app.ID_MODELO, "name": "Nombre del modelo", "referenceObjectType": {"id": "994-ref"}},
+            {"id": app.ID_ASIGNACION, "name": "Asignacion", "defaultType": {"name": "User"}},
+            {"id": app.ID_CATEGORIA, "name": "Categoria", "referenceObjectType": {"id": "1300-ref"}},
+        ]
+
+        def fake_ref_resolver(_config, reference_type_id, raw_value, _auth, *, attr_id="", headers=None):
+            if reference_type_id == "1300-ref":
+                return "CAT-1"
+            if reference_type_id == "994-ref":
+                return None
+            return None
+
+        with (
+            mock.patch.object(app, "fetch_object_type_attributes", return_value=attr_defs),
+            mock.patch.object(app, "resolve_reference_object_key", side_effect=fake_ref_resolver),
+            mock.patch.object(app, "create_reference_object", return_value="MOD-123"),
+            mock.patch.object(app, "fetch_attribute_option_lookup", return_value={}),
+            mock.patch.object(app, "resolve_user_account_id", return_value=None),
+        ):
+            type_id, attrs, issues = app.build_asset_create_payload(config, row)
+
+        attr_map = self._attr_map(attrs)
+        self.assertEqual(type_id, app.CATEGORY_TO_TYPE_ID["portatiles"])
+        self.assertEqual(issues, [])
+        self.assertEqual(attr_map[app.ID_MODELO], "MOD-123")
+        self.assertNotIn(app.ID_ASIGNACION, attr_map)
 
     def test_create_asset_from_payload_returns_real_error_body(self) -> None:
         config = app.AppConfig(

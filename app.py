@@ -449,6 +449,13 @@ def normalize_lookup_key(value: Any) -> str:
     return " ".join(text.split())
 
 
+def canonical_model_key(value: Any) -> str:
+    text = normalize_text(value)
+    text = text.replace('"', "")
+    text = re.sub(r"\s+", " ", text)
+    return text.rstrip(" /")
+
+
 def lookup_tokens(value: Any) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", normalize_lookup_key(value)))
 
@@ -1712,11 +1719,71 @@ def fetch_reference_object_lookup(
     return lookup
 
 
+def create_reference_object(
+    config: AppConfig,
+    reference_object_type_id: str,
+    display_name: str,
+    auth: BasicAuth,
+    headers: dict[str, str],
+) -> str | None:
+    """Crea un objeto de referencia simple cuando el catálogo no lo tiene todavía."""
+    attrs = fetch_object_type_attributes(config, reference_object_type_id, auth, headers)
+    candidate = None
+    for attr in attrs:
+        default_name = normalize_lookup_key((attr.get("defaultType") or {}).get("name") or attr.get("type") or "")
+        if default_name != "text":
+            continue
+        if int(attr.get("minimumCardinality", 0) or 0) > 0:
+            candidate = attr
+            if "name" in normalize_lookup_key(attr.get("name") or ""):
+                break
+    if candidate is None:
+        for attr in attrs:
+            default_name = normalize_lookup_key((attr.get("defaultType") or {}).get("name") or attr.get("type") or "")
+            if default_name == "text" and "name" in normalize_lookup_key(attr.get("name") or ""):
+                candidate = attr
+                break
+    if candidate is None:
+        return None
+
+    url = f"{config.site}/gateway/api/jsm/assets/workspace/{config.workspace_id}/v1/object/create"
+    payload = {
+        "objectTypeId": str(reference_object_type_id),
+        "attributes": [
+            {
+                "objectTypeAttributeId": str(candidate.get("id") or ""),
+                "objectAttributeValues": [{"value": display_name}],
+            }
+        ],
+    }
+    try:
+        with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+            response = client.post(url, auth=auth, headers=headers, json=payload)
+        if response.status_code not in (200, 201):
+            return None
+        body = response.json() if response.text else {}
+        created_key = str(body.get("objectKey") or body.get("key") or "").strip()
+        if not created_key:
+            return None
+        cache = st.session_state.setdefault("mass_upload_reference_cache", {})
+        cache_key = str(reference_object_type_id).strip()
+        ref_lookup = dict(cache.get(cache_key, {}))
+        ref_lookup[normalize_lookup_key(display_name)] = created_key
+        ref_lookup[canonical_model_key(display_name)] = created_key
+        ref_lookup[normalize_lookup_key(created_key)] = created_key
+        cache[cache_key] = ref_lookup
+        return created_key
+    except httpx.HTTPError:
+        return None
+
+
 def resolve_reference_object_key(
     config: AppConfig,
     reference_object_type_id: str,
     raw_value: str,
     auth: BasicAuth,
+    *,
+    attr_id: str = "",
     headers: dict[str, str],
 ) -> str | None:
     """Resuelve texto visible a objectKey para atributos de referencia."""
@@ -1740,6 +1807,13 @@ def resolve_reference_object_key(
         normalized = normalize_lookup_key(candidate)
         if normalized and normalized in lookup:
             return lookup[normalized]
+
+    if attr_id == ID_MODELO:
+        target_key = canonical_model_key(raw)
+        if target_key:
+            for key, object_key in lookup.items():
+                if canonical_model_key(key) == target_key:
+                    return object_key
 
     normalized_raw = normalize_lookup_key(raw)
     for key, object_key in lookup.items():
@@ -1778,7 +1852,16 @@ def resolve_mass_upload_attribute_value(
         return (parsed_date.strftime("%Y-%m-%d") if parsed_date else raw), ""
 
     if reference_object_type_id:
-        resolved = resolve_reference_object_key(config, reference_object_type_id, str(value), auth, headers)
+        resolved = resolve_reference_object_key(
+            config,
+            reference_object_type_id,
+            str(value),
+            auth,
+            attr_id=attr_id,
+            headers=headers,
+        )
+        if not resolved and attr_id == ID_MODELO:
+            resolved = create_reference_object(config, reference_object_type_id, str(value), auth, headers)
         if not resolved:
             return None, f"No pude resolver la referencia `{value}` para el atributo `{attr_def.get('name') or attr_id}`."
         return resolved, ""
@@ -1786,7 +1869,7 @@ def resolve_mass_upload_attribute_value(
     if attr_id == ID_ASIGNACION or "user" in default_type:
         account_id = resolve_user_account_id(config, str(value), auth)
         if not account_id:
-            return None, f"No pude resolver el usuario `{value}` a accountId."
+            return None, ""
         return account_id, ""
 
     option_lookup = fetch_attribute_option_lookup(config, attr_id, auth, headers)
