@@ -6127,6 +6127,71 @@ def build_asset_attributes_payload(row: dict[str, Any]) -> tuple[str, list[dict[
     return type_id, attrs
 
 
+def build_asset_update_attributes_payload(row: dict[str, Any]) -> list[dict[str, Any]]:
+    """Construye atributos crudos para modificación masiva.
+
+    A diferencia del alta, no deriva compañía desde país: solo actualiza
+    las columnas que la persona completó explícitamente.
+    """
+    row_lookup = build_row_lookup(row)
+    mapping = {
+        "name": ID_NAME,
+        "hostname": ID_HOSTNAME,
+        "model": ID_MODELO,
+        "purchase_date": ID_FECHA_COMPRA,
+        "status": ID_ESTADO,
+        "entity": ID_ENTIDAD,
+        "warranty_date": ID_FECHA_GARANTIA,
+        "cost": ID_COSTO,
+        "serial": ID_SERIAL,
+        "country": ID_PAIS,
+        "assignment": ID_ASIGNACION,
+        "provider": ID_PROVEEDOR,
+        "category": ID_CATEGORIA,
+        "company": ID_COMPANIA,
+    }
+    attrs: list[dict[str, Any]] = []
+    for field_name, attr_id in mapping.items():
+        value = get_row_value_by_aliases(row_lookup, MASS_UPLOAD_COLUMN_ALIASES[field_name])
+        if value:
+            attrs.append({"objectTypeAttributeId": str(attr_id), "objectAttributeValues": [{"value": value}]})
+    return attrs
+
+
+def build_asset_update_payload(config: AppConfig, object_type_id: str, row: dict[str, Any]) -> tuple[str, list[dict[str, Any]], list[str]]:
+    """Arma payload de modificación resolviendo valores según el tipo real del asset.
+
+    Identifica el asset por serial pero no reescribe el serial durante el update.
+    """
+    fallback_type_id, _ = build_asset_attributes_payload(row)
+    target_type_id = str(object_type_id or fallback_type_id or "").strip()
+    raw_attrs = build_asset_update_attributes_payload(row)
+    auth, headers = build_auth_headers(config)
+    attr_defs = fetch_object_type_attributes(config, target_type_id, auth, headers)
+    attr_defs_by_id = {str(attr.get("id") or "").strip(): attr for attr in attr_defs if str(attr.get("id") or "").strip()}
+
+    resolved_attrs: list[dict[str, Any]] = []
+    issues: list[str] = []
+    for attr in raw_attrs:
+        attr_id = str(attr.get("objectTypeAttributeId") or "").strip()
+        if attr_id == ID_SERIAL:
+            continue
+        attr_def = attr_defs_by_id.get(attr_id)
+        if not attr_def:
+            continue
+        raw_values = attr.get("objectAttributeValues") or []
+        raw_value = raw_values[0].get("value") if raw_values else ""
+        resolved_value, issue = resolve_mass_upload_attribute_value(config, attr_id, raw_value, attr_def, auth, headers)
+        if issue:
+            issues.append(issue)
+            continue
+        if resolved_value in (None, ""):
+            continue
+        resolved_attrs.append({"objectTypeAttributeId": attr_id, "objectAttributeValues": [{"value": resolved_value}]})
+
+    return target_type_id, resolved_attrs, issues
+
+
 def is_mass_upload_example_row(row: dict[str, Any]) -> bool:
     """Detecta la fila de ejemplo incluida en la plantilla descargable."""
     row_lookup = build_row_lookup(row)
@@ -6213,7 +6278,7 @@ def build_mass_upload_template_bytes() -> bytes:
 
 def resolve_mass_update_identifier(row: dict[str, Any]) -> str:
     row_lookup = build_row_lookup(row)
-    return get_row_value_by_aliases(row_lookup, MASS_UPDATE_IDENTIFIER_ALIASES)
+    return get_row_value_by_aliases(row_lookup, MASS_UPLOAD_COLUMN_ALIASES["serial"])
 
 
 def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]]) -> None:
@@ -6298,20 +6363,47 @@ def render_scripts_page(config: AppConfig, assets: list[dict[str, Any]]) -> None
                 progress = st.progress(0)
                 results = []
                 total_rows = len(frame_mod)
+                seen_serials: dict[str, int] = {}
                 for idx, row in frame_mod.iterrows():
                     row_dict = row.to_dict()
                     identifier = resolve_mass_update_identifier(row_dict)
-                    asset = find_asset_by_identifier(assets, identifier)
-                    if not asset:
-                        results.append({"fila": idx + 1, "identificador": identifier, "ok": False, "detalle": "No encontrado"})
+                    if not identifier:
+                        results.append({"fila": idx + 1, "identificador": "", "ok": False, "detalle": "Falta Serial Number"})
+                        progress.progress(min((idx + 1) / max(total_rows, 1), 1.0))
                         continue
-                    type_id, attrs = build_asset_attributes_payload(row_dict)
+                    normalized_identifier = normalize_text(identifier)
+                    if normalized_identifier in seen_serials:
+                        results.append(
+                            {
+                                "fila": idx + 1,
+                                "identificador": identifier,
+                                "ok": False,
+                                "detalle": f"Serial duplicado en Excel (fila {seen_serials[normalized_identifier]})",
+                            }
+                        )
+                        progress.progress(min((idx + 1) / max(total_rows, 1), 1.0))
+                        continue
+                    seen_serials[normalized_identifier] = idx + 1
+                    asset = find_asset_by_serial(assets, identifier)
+                    if not asset:
+                        results.append({"fila": idx + 1, "identificador": identifier, "ok": False, "detalle": "Serial no encontrado"})
+                        progress.progress(min((idx + 1) / max(total_rows, 1), 1.0))
+                        continue
+                    type_id, attrs, issues = build_asset_update_payload(config, str(asset.get("object_type_id") or ""), row_dict)
                     if simulate:
-                        results.append({"fila": idx + 1, "identificador": identifier, "ok": True, "detalle": f"Simulación ({len(attrs)} attrs)"})
+                        detail = f"Simulación ({len(attrs)} attrs)"
+                        if issues:
+                            detail = f"{detail} | {' | '.join(issues[:3])}"
+                        results.append({"fila": idx + 1, "identificador": identifier, "ok": not issues, "detalle": detail})
                     elif not attrs:
-                        results.append({"fila": idx + 1, "identificador": identifier, "ok": True, "detalle": "Sin cambios para aplicar"})
+                        detail = "Sin cambios para aplicar"
+                        if issues:
+                            detail = " | ".join(issues[:3])
+                        results.append({"fila": idx + 1, "identificador": identifier, "ok": False if issues else True, "detalle": detail})
                     else:
                         ok, msg = update_asset_attributes(config, str(asset.get("object_id", "")), str(asset.get("object_type_id") or type_id), attrs)
+                        if issues:
+                            msg = f"{msg} | {' | '.join(issues[:3])}"
                         if ok:
                             log_movimiento(config, asset, "MODIFICACION_MASIVA", "multiple", "", "updated", "OK", msg, identifier)
                         results.append({"fila": idx + 1, "identificador": identifier, "ok": ok, "detalle": msg})

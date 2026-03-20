@@ -102,9 +102,13 @@ class TestScriptInputs(unittest.TestCase):
         self.assertEqual(attr_map[app.ID_PAIS], "Colombia")
         self.assertEqual(attr_map[app.ID_COMPANIA], "Bancar COL")
 
-    def test_mass_update_identifier_accepts_multiple_aliases(self) -> None:
-        self.assertEqual(app.resolve_mass_update_identifier({"Jira Key": "ISI-31645"}), "ISI-31645")
-        self.assertEqual(app.resolve_mass_update_identifier({"Host name": "WKS-001"}), "WKS-001")
+    def test_mass_update_identifier_accepts_serial_aliases(self) -> None:
+        self.assertEqual(app.resolve_mass_update_identifier({"Serial": "SER-001"}), "SER-001")
+        self.assertEqual(app.resolve_mass_update_identifier({"Número de serie": "SER-002"}), "SER-002")
+
+    def test_mass_update_identifier_uses_serial_only(self) -> None:
+        self.assertEqual(app.resolve_mass_update_identifier({"Serial Number": "SER-001", "Jira Key": "ISI-31645"}), "SER-001")
+        self.assertEqual(app.resolve_mass_update_identifier({"Jira Key": "ISI-31645", "Host name": "WKS-001"}), "")
 
     def test_mass_upload_template_contains_expected_sheets_and_headers(self) -> None:
         raw = app.build_mass_upload_template_bytes()
@@ -174,6 +178,44 @@ class TestScriptInputs(unittest.TestCase):
         self.assertEqual(attr_map[app.ID_ASIGNACION], "acc-123")
         self.assertEqual(attr_map[app.ID_CATEGORIA], "CAT-1")
         self.assertEqual(attr_map[app.ID_COMPANIA], "COM-1")
+
+    def test_build_asset_update_payload_skips_identifier_serial_and_updates_only_filled_columns(self) -> None:
+        config = app.AppConfig(
+            jira_email="jira@example.com",
+            jira_api_token="token",
+            workspace_id="workspace",
+            site="https://bancar.atlassian.net",
+            openai_api_key="",
+            openai_model="gpt-4o-mini",
+            rovo_api_key="",
+            rovo_enabled=False,
+        )
+        row = {
+            "Serial Number": "SER-001",
+            "Hostname": "NB-01-NEW",
+            "Estado del activo": "Stock usado",
+        }
+        attr_defs = [
+            {"id": app.ID_SERIAL, "name": "Serial Number", "defaultType": {"name": "Text"}},
+            {"id": app.ID_HOSTNAME, "name": "Hostname", "defaultType": {"name": "Text"}},
+            {"id": app.ID_ESTADO, "name": "Estado del activo", "defaultType": {"name": "Status"}},
+        ]
+
+        def fake_option_lookup(_config, attr_id, _auth, _headers):
+            return {"stock usado": "STATUS-2"} if attr_id == app.ID_ESTADO else {}
+
+        with (
+            mock.patch.object(app, "fetch_object_type_attributes", return_value=attr_defs),
+            mock.patch.object(app, "fetch_attribute_option_lookup", side_effect=fake_option_lookup),
+        ):
+            type_id, attrs, issues = app.build_asset_update_payload(config, "213", row)
+
+        attr_map = self._attr_map(attrs)
+        self.assertEqual(type_id, "213")
+        self.assertEqual(issues, [])
+        self.assertNotIn(app.ID_SERIAL, attr_map)
+        self.assertEqual(attr_map[app.ID_HOSTNAME], "NB-01-NEW")
+        self.assertEqual(attr_map[app.ID_ESTADO], "STATUS-2")
 
     def test_build_asset_create_payload_creates_missing_model_and_skips_unknown_assignment(self) -> None:
         config = app.AppConfig(
